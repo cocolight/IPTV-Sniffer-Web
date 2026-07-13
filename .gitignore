@@ -1,6 +1,10 @@
 __pycache__/
 *.py[cod]
 *.log
+*.pcap
+*.pcapng
+captures/
+001/
 .DS_Store
 .venv/
 data/*

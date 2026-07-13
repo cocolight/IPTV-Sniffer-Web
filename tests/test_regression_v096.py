@@ -7,6 +7,7 @@ Covers:
 - IPTV auth guarded executor payload / hook generation
 """
 import os
+import gzip
 import json
 import struct
 import sys
@@ -16,7 +17,14 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from services.stb_discovery_service import _extract_ctc_portal_auth, _parse_channel_acquire_json, _parse_chanlist_html, _reassemble_tcp_streams
+from services.stb_discovery_service import (
+    _extract_ctc_portal_auth,
+    _parse_channel_acquire_json,
+    _parse_chanlist_html,
+    _parse_pc_channel_catalog,
+    _reassemble_tcp_streams,
+    analyze_pcap_for_channels,
+)
 from services.export_service import ExportService
 from services.epg_refresh_service import _pad_des_plaintext
 from services.iptv_auth_service import IptvAuthService
@@ -201,6 +209,79 @@ class TestCUSetConfigParsing:
         channels = _parse_chanlist_html(html)
         assert channels[0]["num"] == 1
         assert channels[1]["num"] == 2
+
+
+_NANJING_CHANNEL_HTML = """
+<script>
+jsSetConfig('ChannelCount','1');
+jsSetConfig('Channel','ChannelID="nj-channel-1",ChannelName="江苏城市HD",UserChannelID="19",ChannelURL="igmp://239.49.0.17:8128",TimeShift="1",ChannelSDP="igmp://239.49.0.17:8128|rtsp://180.96.165.41:554/live?AuthInfo=test",TimeShiftURL="rtsp://180.96.165.41:554/live?AuthInfo=test",TimeShiftLength="14400",ChannelFCCServerAddr="180.100.72.185:15970"');
+</script>
+""".encode("gb18030")
+
+_NANJING_PC_CATALOG = """
+<script>
+window.ZEPG_PARAMS.modelData.packageData("PC_ChannelList", {
+  "channelAllList": [
+    {"columncode":"0205","mixno":"19","channelname":"江苏城市HD","channelcode":"nj-channel-1"}
+  ]
+});
+</script>
+""".encode("gb18030")
+
+
+class TestNanjingTelecomParsing:
+    def test_js_set_config_and_fcc_server_addr(self):
+        channels = _parse_chanlist_html(_NANJING_CHANNEL_HTML)
+        assert len(channels) == 1
+        channel = channels[0]
+        assert channel["name"] == "江苏城市HD"
+        assert channel["ip"] == "239.49.0.17"
+        assert channel["port"] == 8128
+        assert channel["fcc_ip"] == "180.100.72.185"
+        assert channel["fcc_port"] == 15970
+        assert channel["backtv_url"].startswith("rtsp://180.96.165.41:554/")
+
+    def test_pc_channel_catalog_group(self):
+        catalog = _parse_pc_channel_catalog(_NANJING_PC_CATALOG)
+        assert catalog["nj-channel-1"]["category"] == "江苏频道"
+        assert catalog["nj-channel-1"]["operator_group"] == "江苏"
+
+    def test_gzip_chunked_pcap_is_discovered_and_grouped(self):
+        compressed = gzip.compress(_NANJING_CHANNEL_HTML)
+        midpoint = len(compressed) // 2
+        chunks = (compressed[:midpoint], compressed[midpoint:])
+        chunked = b"".join(
+            f"{len(chunk):x}\r\n".encode("ascii") + chunk + b"\r\n"
+            for chunk in chunks
+        ) + b"0\r\n\r\n"
+        response_one = (
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: text/html;charset=GBK\r\n"
+            b"Transfer-Encoding: chunked\r\n"
+            b"Content-Encoding: gzip\r\n\r\n" + chunked
+        )
+        response_two = (
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: text/html;charset=GBK\r\n"
+            + f"Content-Length: {len(_NANJING_PC_CATALOG)}\r\n\r\n".encode("ascii")
+            + _NANJING_PC_CATALOG
+        )
+        payload = response_one + response_two
+        frames = []
+        for offset in range(0, len(payload), 173):
+            part = payload[offset:offset + 173]
+            frames.append(_eth_frame(SRV, STB, SPORT, DPORT, SEQ + offset, part))
+        path = _write_pcap(1, frames)
+        try:
+            channels = analyze_pcap_for_channels(path, STB)
+        finally:
+            os.unlink(path)
+        assert len(channels) == 1
+        assert channels[0]["name"] == "江苏城市HD"
+        assert channels[0]["category"] == "江苏频道"
+        assert channels[0]["operator_group"] == "江苏"
+        assert channels[0]["ip"] == "239.49.0.17"
+        assert channels[0]["fcc_port"] == 15970
 
 
 def test_beijing_unicom_channel_acquire_json_is_parsed():

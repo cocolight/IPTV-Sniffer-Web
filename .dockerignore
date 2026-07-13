@@ -4,6 +4,10 @@ __pycache__
 *.pyc
 *.pyo
 *.log
+*.pcap
+*.pcapng
+captures/
+001/
 data/*
 !data/.gitkeep
 output/*

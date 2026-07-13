@@ -374,12 +374,16 @@ def _reassemble_tcp_streams(pcap_path: str) -> dict[tuple[str, int, str, int], b
 
 
 def _parse_chanlist_html(html: bytes) -> list[dict[str, Any]]:
-    """Parse getchannellistHWCU.jsp HTML response into channel dicts."""
-    text = html.decode("utf-8", errors="replace")
-    # Single-quote outer delimiter allows double quotes inside (typical format)
-    blocks = re.findall(r"CUSetConfig\('Channel',\s*'([^']+)'\)", text)
-    # Double-quote outer delimiter allows single quotes inside
-    blocks += re.findall(r'CUSetConfig\("Channel",\s*"([^"]+)"\)', text)
+    """Parse CTC/CU middleware Channel config calls into channel dicts."""
+    text = _decode_payload_text(html)
+    call_re = re.compile(
+        r"""(?:(?:Authentication\.)?(?:CUSetConfig|CTCSetConfig)|jsSetConfig)\s*\(
+            \s*(?P<key_quote>['"])Channel(?P=key_quote)\s*,
+            \s*(?P<value_quote>['"])(?P<value>.*?)(?P=value_quote)\s*\)
+        """,
+        re.DOTALL | re.VERBOSE,
+    )
+    blocks = [match.group("value") for match in call_re.finditer(text)]
     channels: list[dict[str, Any]] = []
     for block in blocks:
         raw = re.findall(r"""(\w+)=(?:"([^"]*)"|'([^']*)')""", block)
@@ -393,6 +397,17 @@ def _parse_chanlist_html(html: bytes) -> list[dict[str, Any]]:
         time_shift_days_s = pairs.get("TimeShiftLength", "")
         fcc_ip = pairs.get("ChannelFCCIP", "").strip()
         fcc_port_s = pairs.get("ChannelFCCPort", "")
+        fcc_addr = (
+            pairs.get("ChannelFCCServerAddr") or pairs.get("ChannelFccAgentAddr") or
+            pairs.get("ChannelFCCAddr") or ""
+        ).strip()
+        if fcc_addr:
+            addr_host, sep, addr_port = fcc_addr.rpartition(":")
+            if sep and addr_host:
+                fcc_ip = fcc_ip or addr_host.strip()
+                fcc_port_s = fcc_port_s or addr_port.strip()
+            elif not fcc_ip:
+                fcc_ip = fcc_addr
         fec_port_s = pairs.get("ChannelFECPort", "")
         group_name = (
             pairs.get("GroupName") or pairs.get("ChannelGroupName") or pairs.get("ChannelGroup") or
@@ -403,7 +418,13 @@ def _parse_chanlist_html(html: bytes) -> list[dict[str, Any]]:
             pairs.get("BackUrl") or pairs.get("TimeshiftUrl") or
             pairs.get("startOverUrl") or ""
         ).strip()
-        m = re.match(r"(?:igmp|udp|rtp)://([0-9.]+):(\d+)", channel_url)
+        m = re.match(r"(?:igmp|udp|rtp)://([0-9.]+):(\d+)", channel_url, re.IGNORECASE)
+        if not m:
+            m = re.search(
+                r"(?:igmp|udp|rtp)://([0-9.]+):(\d+)",
+                pairs.get("ChannelSDP", ""),
+                re.IGNORECASE,
+            )
         ip, port = (m.group(1), int(m.group(2))) if m else ("", 0)
         if not ip or not port or not chan_name:
             continue
@@ -427,6 +448,75 @@ def _parse_chanlist_html(html: bytes) -> list[dict[str, Any]]:
         )
     channels.sort(key=lambda x: x["num"])
     return channels
+
+
+_NANJING_COLUMN_GROUPS = {
+    "0204": ("央视频道", "CCTV"),
+    "0205": ("江苏频道", "江苏"),
+    "0206": ("其它频道", "其它"),
+    "0207": ("卫视频道", "卫视"),
+    "020B": ("广播频道", "广播"),
+}
+
+
+def _extract_json_object(text: str, start: int) -> dict[str, Any] | None:
+    """Decode one JSON object starting at or after *start* using brace counting."""
+    start = text.find("{", start)
+    if start < 0:
+        return None
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    value = json.loads(text[start:index + 1])
+                except (TypeError, ValueError):
+                    return None
+                return value if isinstance(value, dict) else None
+    return None
+
+
+def _parse_pc_channel_catalog(body: bytes) -> dict[str, dict[str, str]]:
+    """Parse Jiangsu Telecom PC_ChannelList metadata used by its EPG player."""
+    text = _decode_payload_text(body)
+    marker = re.search(r"packageData\s*\(\s*['\"]PC_ChannelList['\"]\s*,", text)
+    if not marker:
+        return {}
+    payload = _extract_json_object(text, marker.end())
+    if not payload:
+        return {}
+    catalog: dict[str, dict[str, str]] = {}
+    for item in payload.get("channelAllList") or []:
+        if not isinstance(item, dict):
+            continue
+        channel_id = str(item.get("channelcode") or "").strip()
+        if not channel_id:
+            continue
+        column_code = str(item.get("columncode") or "").strip().upper()
+        category, operator_group = _NANJING_COLUMN_GROUPS.get(column_code, ("", ""))
+        catalog[channel_id] = {
+            "name": str(item.get("channelname") or "").strip(),
+            "category": category,
+            "operator_group": operator_group,
+            "mixno": str(item.get("mixno") or "").strip(),
+        }
+    return catalog
 
 
 def _parse_vsp_json(body: bytes) -> list[dict[str, Any]]:
@@ -938,12 +1028,15 @@ def analyze_pcap_for_channels(pcap_path: str, stb_ip: str) -> list[dict[str, Any
 
     all_channels: list[dict[str, Any]] = []
     seen_keys: set[str] = set()
+    channel_catalog: dict[str, dict[str, str]] = {}
 
     for key, raw in response_streams.items():
         responses = _split_http_responses(raw)
         for headers, body in responses:
             if not body:
                 continue
+            if b"PC_ChannelList" in body and b"channelAllList" in body:
+                channel_catalog.update(_parse_pc_channel_catalog(body))
             # Beijing Unicom / Hisense IP811N channelAcquire JSON response
             # uses the misspelled channleInfoStruct field.
             if (
@@ -957,8 +1050,9 @@ def analyze_pcap_for_channels(pcap_path: str, stb_ip: str) -> list[dict[str, Any
                     if k not in seen_keys:
                         seen_keys.add(k)
                         all_channels.append(ch)
-            # Look for getchannellistHWCU.jsp response (has CUSetConfig Channel calls)
-            elif b"CUSetConfig('Channel'" in body or b'CUSetConfig("Channel"' in body:
+            # CTC/CU channel middleware pages. Jiangsu Telecom uses
+            # frameset_builder.jsp + jsSetConfig and serves a GBK, gzip/chunked body.
+            elif b"SetConfig" in body and (b"'Channel'" in body or b'"Channel"' in body):
                 parsed = _parse_chanlist_html(body)
                 for ch in parsed:
                     k = f"{ch['ip']}:{ch['port']}"
@@ -985,6 +1079,25 @@ def analyze_pcap_for_channels(pcap_path: str, stb_ip: str) -> list[dict[str, Any
                 if k not in seen_keys:
                     seen_keys.add(k)
                     all_channels.append(ch)
+
+        if not responses and b"SetConfig" in raw and (b"'Channel'" in raw or b'"Channel"' in raw):
+            parsed = _parse_chanlist_html(raw)
+            for ch in parsed:
+                k = f"{ch['ip']}:{ch['port']}"
+                if k not in seen_keys:
+                    seen_keys.add(k)
+                    all_channels.append(ch)
+
+    for channel in all_channels:
+        metadata = channel_catalog.get(str(channel.get("channel_id") or ""))
+        if not metadata:
+            continue
+        if metadata.get("name") and not channel.get("name"):
+            channel["name"] = metadata["name"]
+        if metadata.get("category") and channel.get("category") == "其它频道":
+            channel["category"] = metadata["category"]
+        if metadata.get("operator_group") and not channel.get("operator_group"):
+            channel["operator_group"] = metadata["operator_group"]
 
     all_channels.sort(key=lambda x: x["num"])
     return all_channels

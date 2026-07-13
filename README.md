@@ -1,4 +1,4 @@
-# IPTV Sniffer Web v1.2.4
+# IPTV Sniffer Web v1.2.5
 
 适用于 **飞牛 NAS / Linux Docker / 交换机镜像口运营商频道发现** 的 IPTV 频道发现、线路整理与 `rtp2httpd` 播放列表工作台。
 
@@ -37,7 +37,7 @@ docker run -d \
   -e TZ=Asia/Shanghai \
   -v $(pwd)/data:/app/data \
   -v $(pwd)/output:/app/output \
-  roninriddle/iptv-sniffer-web:1.2.4
+  roninriddle/iptv-sniffer-web:1.2.5
 ```
 
 打开：
@@ -64,7 +64,7 @@ pytest -q
 
 - 测试版使用 `x.y.z-test`，例如 `1.2.1-test`；
 - 测试版只推送 GitHub tag 与 Docker Hub 同名 tag，不推送 `latest`；
-- 正式版使用 `x.y.z`，例如 `1.2.4`；
+- 正式版使用 `x.y.z`，例如 `1.2.5`；
 - 正式版发布时才同时推送 Docker Hub `x.y.z` 与 `latest`。
 
 ## 唯一推荐拓扑：交换机镜像口
@@ -214,6 +214,7 @@ http://rtp2httpd-host:5140/rtp/239.x.x.x:port
 
 ## 版本记录
 
+- `v1.2.5`：新增南京电信频道表解析：支持 `frameset_builder.jsp` 中 GBK、gzip、chunked 编码的 `jsSetConfig('Channel', ...)` 下发方式，提取频道名称、组播地址、RTSP 回看地址及 `ChannelFCCServerAddr`；兼容 `CTCSetConfig`、`CUSetConfig` 与 `PC_ChannelList.channelAllList`，并将门户栏目分组应用到频道列表；抓包文件默认从 Git 与 Docker 构建上下文排除；
 - `v1.2.4`：修复 DHCP Option60 处理：抓包提取时改为存储原始十六进制（如 `dhcpcd-5.5.6` → `6468637063642d352e352e36`），避免 ASCII 字符串填入十六进制字段时因奇数位报错；`_normalize_hex` 同步支持 ASCII 文本直接输入并自动转十六进制；
 - `v1.2.3`：修复 STB 开机捕获 `channelAcquire` 频道解析失败问题：当抓包漏掉 HTTP 响应前几个 TCP 包（含 headers 和 JSON 数组开头）时，重组流中无 `HTTP/` 标记、频道数组起始丢失，原解析器返回 0 个频道；新增三层 fallback：先剥离内嵌的 chunked 分块大小行（`\r\n2000\r\n`），再用括号计数逐对象提取完整 JSON 频道条目，可恢复除首个截断条目外的全部频道；
 - `v1.2.2`：STB 开机捕获新增北京联通 / 海信 IP811N `channelAcquire` JSON 频道表解析，支持一次开机抓取完整频道列表（含 `channleInfoStruct` 拼写兼容）、组播地址、FCC/FEC、回看地址与 UserToken；若运营商频道表包含频道分组，将分组应用到频道列表与导出文件，并保留原始运营商分组；STB 捕获完成后保留最近一次 pcap，页面新增「导出抓包文件」用于一键下载排查；频道分类筛选改为按当前频道表动态生成，支持运营商自定义分组；
