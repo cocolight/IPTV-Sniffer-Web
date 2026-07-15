@@ -31,8 +31,8 @@ from services.iptv_auth_service import IptvAuthService
 import services.iptv_auth_service as iptv_auth_module
 from services.log_service import AppLogger
 import app as app_module
-from app import _parse_rtp2httpd_config_text, fill_channel_name_from_metadata
-from services.epg_service import normalize_channel_name
+from app import _parse_rtp2httpd_config_text, can_replace_with_epg_name, fill_channel_name_from_metadata
+from services.epg_service import EpgService, normalize_channel_name
 from services.storage_service import ChannelStore
 from utils import channel_group_key, redact_sensitive_text
 
@@ -870,6 +870,30 @@ def test_cctv4_regional_auto_name_beats_short_epg_alias():
     }
     fill_channel_name_from_metadata(item, allow_epg_name=True)
     assert item["name"] == "CCTV4中文国际欧洲"
+
+
+@pytest.mark.parametrize(
+    "operator_name",
+    ["CCTV音乐", "CCTV少儿", "CCTV164KSDR", "CGTV", "CETV4"],
+)
+def test_single_character_epg_alias_does_not_replace_operator_name(tmp_path, operator_name):
+    service = EpgService(AppLogger(tmp_path / "app.log"), tmp_path / "epg.json")
+    service._index = {"c": {"id": "C", "name": "C", "names": ["C"]}}
+    stored = {"name": operator_name}
+    item = {"name": operator_name, "auto_name": operator_name}
+
+    service.enrich_item(item)
+    fill_channel_name_from_metadata(item, allow_epg_name=can_replace_with_epg_name(stored, item))
+
+    assert item["name"] == operator_name
+    assert "tvg_name" not in item
+
+
+def test_single_character_epg_name_still_matches_exactly(tmp_path):
+    service = EpgService(AppLogger(tmp_path / "app.log"), tmp_path / "epg.json")
+    service._index = {"c": {"id": "C", "name": "C", "names": ["C"]}}
+
+    assert service.match("C")["name"] == "C"
 
 
 # ── Removed UDP candidate sniffer flow ───────────────────────────────────

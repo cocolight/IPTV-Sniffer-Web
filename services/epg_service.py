@@ -375,11 +375,17 @@ class EpgService:
     def _substring_match_ok(a: str, b: str) -> bool:
         """True if a is substring of b (or vice versa) without a digit-boundary collision.
 
+        Single-character names are only eligible for exact matching.  Allowing them
+        into fuzzy matching makes an EPG alias such as "C" match every unmatched
+        CCTV/CETV/CGTV channel and can replace the operator-provided display name.
+
         Prevents "cctv1" from matching "cctv10" / "cctv12" — after the shared prefix,
         if the very next character in the longer string is a digit AND the shorter string
         already ends with a digit, it means they share only a numeric prefix, not the
         same channel number.
         """
+        if min(len(a), len(b)) < 2:
+            return False
         longer, shorter = (b, a) if len(b) >= len(a) else (a, b)
         idx = longer.find(shorter)
         if idx == -1:
