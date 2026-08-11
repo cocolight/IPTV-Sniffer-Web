@@ -331,8 +331,8 @@ th:nth-child(9), td:nth-child(9) { width: 248px; }
 tr:last-child td { border-bottom: 0; }
 td.empty { color: var(--muted); text-align: center; padding: 20px; }
 td.mono { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-/* Channel list table has 5 cols: checkbox / name / address / category / EPG */
-.cl-table { min-width: 700px; }
+/* Channel list table: checkbox / name / address / category / EPG / HD / action */
+.cl-table { min-width: 820px; }
 .cl-table th.sortable { cursor: pointer; user-select: none; white-space: nowrap; }
 .cl-table th.sortable::after { content: " ⇅"; opacity: 0.35; font-size: 11px; }
 .cl-table th.sort-asc::after { content: " ↑"; opacity: 1; }
@@ -342,7 +342,8 @@ td.mono { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .cl-table th:nth-child(3), .cl-table td:nth-child(3) { width: 170px; }
 .cl-table th:nth-child(4), .cl-table td:nth-child(4) { width: 90px; }
 .cl-table th:nth-child(5), .cl-table td:nth-child(5) { width: 90px; }
-.cl-table th:nth-child(6), .cl-table td:nth-child(6) { width: 130px; }
+.cl-table th:nth-child(6), .cl-table td:nth-child(6) { width: 68px; }
+.cl-table th:nth-child(7), .cl-table td:nth-child(7) { width: 72px; }
 .diag-table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 12px; }
 .diag-table td { padding: 5px 8px; border-bottom: 1px solid var(--border, #e5e7eb); vertical-align: top; }
 .diag-section { border: 1px solid var(--line); border-radius: 8px; margin-top: 10px; overflow: hidden; background: #fff; }
@@ -364,6 +365,22 @@ td.mono { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 td code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
 .channel-name { min-width: 144px; }
 .channel-category { min-width: 92px; }
+
+.channel-edit-dialog {
+  width: min(560px, calc(100% - 28px));
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 18px;
+  color: var(--text);
+  background: var(--card);
+  box-shadow: 0 20px 60px rgba(15, 23, 42, .22);
+}
+.channel-edit-dialog::backdrop { background: rgba(15, 23, 42, .38); }
+.channel-edit-dialog form { display: grid; gap: 12px; }
+.channel-edit-dialog .section-title { margin: 0; }
+.channel-edit-dialog h2 { margin: 0; }
+.dialog-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 2px; }
+.dialog-actions-spacer { flex: 1 1 0; }
 
 .badge { display: inline-flex; min-height: 24px; padding: 0 8px; border-radius: 999px; align-items: center; font-size: 12px; font-weight: 750; }
 .badge.ok { color: var(--ok); background: #e6f5ee; }

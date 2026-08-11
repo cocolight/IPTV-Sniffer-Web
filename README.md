@@ -214,6 +214,7 @@ http://rtp2httpd-host:5140/rtp/239.x.x.x:port
 
 ## 版本记录
 
+- `v1.2.7`：针对 [Issue #3](https://github.com/roninriddle/IPTV-Sniffer-Web/issues/3) 新增频道线路信息自定义编辑：可逐条修改频道名称、分类、EPG 标识与高清标记；自动识别值和上次手工编辑值分别保存，可一键恢复，并在重新导入运营商频道表或重新匹配 EPG 后继续保留手工编辑；JSON 导出同步包含高清标记；
 - `v1.2.6`：针对 [Issue #2](https://github.com/roninriddle/IPTV-Sniffer-Web/issues/2) 的频道名称后续反馈，修复 EPG 单字符频道名参与模糊匹配时覆盖运营商频道名称的问题，避免 CCTV 音乐/少儿、CCTV16 4K SDR、CGTV、CETV4 等未精确匹配的频道被错误显示为 `C`；
 - `v1.2.5`：新增南京电信频道表解析：支持 `frameset_builder.jsp` 中 GBK、gzip、chunked 编码的 `jsSetConfig('Channel', ...)` 下发方式，提取频道名称、组播地址、RTSP 回看地址及 `ChannelFCCServerAddr`；兼容 `CTCSetConfig`、`CUSetConfig` 与 `PC_ChannelList.channelAllList`，并将门户栏目分组应用到频道列表；抓包文件默认从 Git 与 Docker 构建上下文排除；
 - `v1.2.4`：修复 DHCP Option60 处理：抓包提取时改为存储原始十六进制（如 `dhcpcd-5.5.6` → `6468637063642d352e352e36`），避免 ASCII 字符串填入十六进制字段时因奇数位报错；`_normalize_hex` 同步支持 ASCII 文本直接输入并自动转十六进制；

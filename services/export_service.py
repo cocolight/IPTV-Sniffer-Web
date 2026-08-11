@@ -106,6 +106,7 @@ class ExportService:
                 tvg_name=str(row.get("tvg_name", "") or "").strip(),
                 tvg_logo=str(row.get("tvg_logo", "") or "").strip(),
                 epg_source=str(row.get("epg_source", "") or "").strip(),
+                is_hd=bool(row.get("is_hd", False)),
                 is_primary=bool(row.get("is_primary", False)),
                 export_health_status=str(row.get("export_health_status", "") or "").strip(),
                 export_health_http_code=self._safe_int(row.get("export_health_http_code")),
@@ -426,6 +427,7 @@ class ExportService:
                 "tvg_logo": channel.tvg_logo,
                 "epg_source": channel.epg_source,
                 "group_title": channel.category,
+                "is_hd": channel.is_hd,
                 "flag": [] if channel.probe_status != "failed" else ["probe_failed"],
                 "live": {
                     "local-multicast": {

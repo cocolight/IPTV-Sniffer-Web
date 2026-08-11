@@ -796,10 +796,19 @@ def api_epg_rematch():
         rows = []
         updated = 0
         for ch in channels.values():
+            original = ch.get("original_metadata")
+            if not isinstance(original, dict):
+                original = ChannelStore._metadata_fields(ch)
             item = dict(ch)
+            item.update(ChannelStore._metadata_fields(original))
             epg_service.enrich_item(item, epg_url, only_missing=False)
+            item["original_metadata"] = ChannelStore._metadata_fields(item)
+            edited = ch.get("edited_metadata")
+            if isinstance(edited, dict):
+                item.update(ChannelStore._metadata_fields(edited))
+                item["edited_metadata"] = ChannelStore._metadata_fields(edited)
             rows.append(item)
-            if item.get("tvg_id") != ch.get("tvg_id"):
+            if item["original_metadata"].get("tvg_id") != original.get("tvg_id"):
                 updated += 1
         channel_store.save_rows(rows)
         logger.info(f"EPG 重新匹配完成：共处理 {len(rows)} 个频道，更新 {updated} 个")
@@ -858,26 +867,28 @@ def _do_operator_import(channels: list[dict]) -> dict:
             "quality_group": stored.get("quality_group", ""),
         })
     enriched = enrich_channel_rows(rows, settings)
-    # Save rows: preserve user-modified names but always update tech params (FCC/FEC/probe).
+    # Refresh automatic values, but keep explicit user edits available and active.
     to_save = []
     for row in enriched:
         key = str(row.get("key", ""))
         stored = existing.get(key)
-        if stored and str(stored.get("name", "")).strip():
-            op_name = str(row.get("auto_name", "")).strip()
-            stored_name = str(stored.get("name", "")).strip()
-            if stored_name and stored_name != op_name:
-                # User renamed this channel — keep their name but refresh tech fields.
-                merged = dict(stored)
-                for tech_field in ("fcc_ip", "fcc_port", "fec_port", "is_hd", "time_shift"):
-                    if row.get(tech_field) is not None and row.get(tech_field) != "":
-                        merged[tech_field] = row[tech_field]
-                if row.get("category"):
-                    merged["category"] = row["category"]
-                if row.get("operator_group"):
-                    merged["operator_group"] = row["operator_group"]
-                to_save.append(merged)
-                continue
+        original = ChannelStore._metadata_fields(row)
+        row["original_metadata"] = original
+        if stored:
+            edited = stored.get("edited_metadata")
+            if isinstance(edited, dict):
+                edited = ChannelStore._metadata_fields(edited)
+                row.update(edited)
+                row["edited_metadata"] = edited
+            else:
+                # Compatibility with old records where a changed name implied a manual edit.
+                old_name = str(stored.get("name") or "").strip()
+                auto_name = str(row.get("auto_name") or "").strip()
+                if old_name and auto_name and old_name != auto_name:
+                    edited = dict(original)
+                    edited["name"] = old_name
+                    row.update(edited)
+                    row["edited_metadata"] = edited
         to_save.append(row)
     ch_result = channel_store.save_rows(to_save) if to_save else {"saved": 0, "deleted": 0, "total": 0}
 
@@ -1156,6 +1167,38 @@ def api_channels_save():
     result = channel_store.save_rows(rows)
     logger.info(f"已导入频道列表：新增或更新 {result['saved']} 条，删除 {result['deleted']} 条")
     return api_success(result)
+
+
+@app.post("/api/channels/<path:channel_key>/metadata")
+def api_channels_patch_metadata(channel_key: str):
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return api_error("请求体格式不正确")
+    try:
+        channel = channel_store.patch_metadata(channel_key, data)
+        if not channel:
+            return api_error("频道不存在", 404)
+        logger.info(f"已编辑频道线路信息：{channel_key}")
+        return api_success({"channel": channel})
+    except ValueError as exc:
+        return api_error(str(exc), 400)
+
+
+@app.post("/api/channels/<path:channel_key>/metadata/restore")
+def api_channels_restore_metadata(channel_key: str):
+    data = request.get_json(silent=True) or {}
+    source = str(data.get("source") or "").strip()
+    if source not in {"original", "edited"}:
+        return api_error("source 必须为 original 或 edited")
+    try:
+        channel = channel_store.restore_metadata(channel_key, source)
+        if not channel:
+            return api_error("频道不存在", 404)
+        label = "原始识别" if source == "original" else "编辑"
+        logger.info(f"已恢复频道线路{label}信息：{channel_key}")
+        return api_success({"channel": channel})
+    except ValueError as exc:
+        return api_error(str(exc), 400)
 
 
 @app.post("/api/channels/delete")

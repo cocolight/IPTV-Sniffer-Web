@@ -578,10 +578,12 @@
                     <th class="sortable" data-sort="addr">组播地址</th>
                     <th class="sortable" data-sort="category">分类</th>
                     <th class="sortable" data-sort="epg">EPG 标识</th>
+                    <th>高清</th>
+                    <th>操作</th>
                   </tr>
                 </thead>
                 <tbody id="clChannelTableBody">
-                  <tr><td colspan="5" class="empty">频道列表为空，请先完成运营商频道发现并导入。</td></tr>
+                  <tr><td colspan="7" class="empty">频道列表为空，请先完成运营商频道发现并导入。</td></tr>
                 </tbody>
               </table>
             </div>
@@ -666,6 +668,41 @@
     <option value="卫视频道">
     <option value="其它频道">
   </datalist>
+
+  <dialog id="channelEditDialog" class="channel-edit-dialog" aria-labelledby="channelEditTitle">
+    <form id="channelEditForm" method="dialog">
+      <div class="section-title">
+        <h2 id="channelEditTitle">编辑频道信息</h2>
+        <span id="channelEditAddress" class="muted small mono"></span>
+      </div>
+      <p class="task-description">修改后将用于后续线路导出。自动识别结果会单独保留，可随时恢复。</p>
+      <div class="form-grid">
+        <label>
+          频道名称
+          <input id="channelEditName" type="text" required autocomplete="off">
+        </label>
+        <label>
+          分类
+          <input id="channelEditCategory" type="text" list="categoryDatalist" autocomplete="off">
+        </label>
+        <label>
+          EPG 标识
+          <input id="channelEditEpgId" type="text" autocomplete="off">
+        </label>
+        <label class="checkbox-label align-self-center">
+          <input id="channelEditHd" type="checkbox">
+          标记为高清频道
+        </label>
+      </div>
+      <div class="dialog-actions">
+        <button id="channelEditRestoreOriginal" class="secondary" type="button">恢复原始识别</button>
+        <button id="channelEditRestoreEdited" class="secondary" type="button">恢复上次编辑</button>
+        <span class="dialog-actions-spacer"></span>
+        <button id="channelEditCancel" class="secondary" type="button">取消</button>
+        <button id="channelEditSave" class="primary" type="submit">保存修改</button>
+      </div>
+    </form>
+  </dialog>
 
   <footer class="footer">
     <span>{{ app_name }} v{{ app_version }}</span>

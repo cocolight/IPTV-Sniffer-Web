@@ -78,6 +78,58 @@ class ChannelStore:
     def get(self, key: str) -> dict[str, Any] | None:
         return self.load().get(key)
 
+    @staticmethod
+    def _metadata_fields(row: dict[str, Any]) -> dict[str, Any]:
+        """Return the fields that users may override in the exported playlist."""
+        return {
+            "name": str(row.get("name") or "").strip(),
+            "category": str(row.get("category") or "").strip(),
+            "tvg_id": str(row.get("tvg_id") or "").strip(),
+            "is_hd": bool(row.get("is_hd", False)),
+        }
+
+    def patch_metadata(self, key: str, values: dict[str, Any]) -> dict[str, Any] | None:
+        """Apply user edits while retaining values from automatic recognition."""
+        with self._lock:
+            data = self.load()
+            channel = data.get(key)
+            if not channel:
+                return None
+            original = channel.get("original_metadata")
+            if not isinstance(original, dict):
+                original = self._metadata_fields(channel)
+            edited = self._metadata_fields(values)
+            if not edited["name"]:
+                raise ValueError("频道名称不能为空")
+            if not edited["category"]:
+                edited["category"] = "其它频道"
+            channel.update(edited)
+            channel["original_metadata"] = original
+            channel["edited_metadata"] = edited
+            channel["updated_at"] = int(time.time())
+            _atomic_dump_json(self.path, data)
+            return dict(channel)
+
+    def restore_metadata(self, key: str, source: str) -> dict[str, Any] | None:
+        """Restore either the latest automatic values or the last user edit."""
+        with self._lock:
+            data = self.load()
+            channel = data.get(key)
+            if not channel:
+                return None
+            metadata_key = "original_metadata" if source == "original" else "edited_metadata"
+            values = channel.get(metadata_key)
+            if not isinstance(values, dict):
+                label = "原始识别" if source == "original" else "编辑"
+                raise ValueError(f"没有可恢复的{label}信息")
+            restored = self._metadata_fields(values)
+            if not restored["name"]:
+                raise ValueError("可恢复的频道名称为空")
+            channel.update(restored)
+            channel["updated_at"] = int(time.time())
+            _atomic_dump_json(self.path, data)
+            return dict(channel)
+
     def save_rows(self, rows: list[dict[str, Any]]) -> dict[str, Any]:
         with self._lock:
             data = self.load()
@@ -122,6 +174,9 @@ class ChannelStore:
                     "tvg_name": str(row.get("tvg_name") or data.get(key, {}).get("tvg_name", "")),
                     "tvg_logo": str(row.get("tvg_logo") or data.get(key, {}).get("tvg_logo", "")),
                     "epg_source": str(row.get("epg_source") or data.get(key, {}).get("epg_source", "")),
+                    "is_hd": bool(row.get("is_hd", data.get(key, {}).get("is_hd", False))),
+                    "original_metadata": row.get("original_metadata", data.get(key, {}).get("original_metadata")),
+                    "edited_metadata": row.get("edited_metadata", data.get(key, {}).get("edited_metadata")),
                     "auto_name": str(row.get("auto_name") or data.get(key, {}).get("auto_name", "")),
                     "auto_name_source": str(row.get("auto_name_source") or data.get(key, {}).get("auto_name_source", "")),
                     "probed_at": row.get("probed_at", data.get(key, {}).get("probed_at")),

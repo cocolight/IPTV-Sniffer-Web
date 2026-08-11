@@ -48,6 +48,7 @@ class ChannelRecord:
     tvg_name: str = ""
     tvg_logo: str = ""
     epg_source: str = ""
+    is_hd: bool = False
     is_primary: bool = False
     export_health_status: str = ""
     export_health_http_code: int | None = None

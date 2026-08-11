@@ -932,3 +932,52 @@ def test_export_without_channels_uses_saved_channel_list(tmp_path):
     finally:
         app_module.channel_store = original_store
         app_module.export_service.output_dir = original_output
+
+
+def test_channel_metadata_edit_and_restore_keeps_both_versions(tmp_path):
+    store = ChannelStore(tmp_path / "channels.json")
+    key = "239.1.1.1:8001"
+    store.save_rows([{
+        "key": key, "host": "239.1.1.1", "port": 8001,
+        "name": "CCTV1", "category": "央视频道", "tvg_id": "cctv1", "is_hd": False,
+    }])
+
+    edited = store.patch_metadata(key, {
+        "name": "CCTV-1 综合", "category": "我的收藏", "tvg_id": "cctv1hd", "is_hd": True,
+    })
+    assert edited["name"] == "CCTV-1 综合"
+    assert edited["original_metadata"] == {
+        "name": "CCTV1", "category": "央视频道", "tvg_id": "cctv1", "is_hd": False,
+    }
+
+    original = store.restore_metadata(key, "original")
+    assert original["name"] == "CCTV1"
+    assert original["is_hd"] is False
+    restored_edit = store.restore_metadata(key, "edited")
+    assert restored_edit["name"] == "CCTV-1 综合"
+    assert restored_edit["category"] == "我的收藏"
+    assert restored_edit["is_hd"] is True
+
+
+def test_channel_metadata_api_rejects_empty_name_and_restores(tmp_path):
+    original_store = app_module.channel_store
+    try:
+        app_module.channel_store = ChannelStore(tmp_path / "channels.json")
+        key = "239.1.1.1:8001"
+        app_module.channel_store.save_rows([{
+            "key": key, "host": "239.1.1.1", "port": 8001,
+            "name": "CCTV1", "category": "央视频道", "tvg_id": "cctv1",
+        }])
+        client = app_module.app.test_client()
+        encoded = "239.1.1.1%3A8001"
+        invalid = client.post(f"/api/channels/{encoded}/metadata", json={"name": ""})
+        assert invalid.status_code == 400
+        saved = client.post(f"/api/channels/{encoded}/metadata", json={
+            "name": "CCTV-1", "category": "自定义", "tvg_id": "cctv1-hd", "is_hd": True,
+        })
+        assert saved.status_code == 200
+        restored = client.post(f"/api/channels/{encoded}/metadata/restore", json={"source": "original"})
+        assert restored.status_code == 200
+        assert restored.get_json()["data"]["channel"]["name"] == "CCTV1"
+    finally:
+        app_module.channel_store = original_store

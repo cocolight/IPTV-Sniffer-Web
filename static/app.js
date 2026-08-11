@@ -491,7 +491,7 @@ function renderChannelList(channels) {
     : `${channels.length} / ${total} 个`;
   const tbody = $("clChannelTableBody");
   if (!channels.length) {
-    tbody.innerHTML = '<tr><td colspan="5" class="empty">频道列表为空，请先完成运营商频道发现并导入。</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="7" class="empty">频道列表为空，请先完成运营商频道发现并导入。</td></tr>';
     refreshChannelSelectionControls();
     return;
   }
@@ -506,6 +506,8 @@ function renderChannelList(channels) {
       <td class="mono small">${escapeHtml(addr)}</td>
       <td>${escapeHtml(ch.category || "")}</td>
       <td class="mono small">${escapeHtml(epg)}</td>
+      <td>${ch.is_hd ? '<span class="badge hd">高清</span>' : '<span class="muted small">—</span>'}</td>
+      <td><button class="secondary xs-btn channel-edit-btn" type="button" data-key="${escapeHtml(ch.key || "")}">编辑</button></td>
     </tr>`;
   }).join("");
   tbody.querySelectorAll(".cl-check").forEach((cb) => {
@@ -514,7 +516,46 @@ function renderChannelList(channels) {
       refreshChannelSelectionControls();
     });
   });
+  tbody.querySelectorAll(".channel-edit-btn").forEach((btn) => {
+    btn.addEventListener("click", () => openChannelEdit(btn.dataset.key || ""));
+  });
   refreshChannelSelectionControls();
+}
+
+let activeChannelEditKey = "";
+
+function openChannelEdit(key) {
+  const channel = (state.channelList || []).find((item) => item.key === key);
+  if (!channel) return;
+  activeChannelEditKey = key;
+  $("channelEditName").value = channel.name || "";
+  $("channelEditCategory").value = channel.category || "";
+  $("channelEditEpgId").value = channel.tvg_id || "";
+  $("channelEditHd").checked = !!channel.is_hd;
+  $("channelEditAddress").textContent = key;
+  $("channelEditRestoreOriginal").disabled = !channel.original_metadata;
+  $("channelEditRestoreEdited").disabled = !channel.edited_metadata;
+  $("channelEditDialog").showModal();
+}
+
+function closeChannelEdit() {
+  activeChannelEditKey = "";
+  $("channelEditDialog").close();
+}
+
+async function restoreChannelMetadata(source) {
+  if (!activeChannelEditKey) return;
+  try {
+    const data = await requestJson(`/api/channels/${encodeURIComponent(activeChannelEditKey)}/metadata/restore`, {
+      method: "POST", body: JSON.stringify({source}),
+    });
+    const channel = data.channel;
+    $("channelEditName").value = channel.name || "";
+    $("channelEditCategory").value = channel.category || "";
+    $("channelEditEpgId").value = channel.tvg_id || "";
+    $("channelEditHd").checked = !!channel.is_hd;
+    await loadChannelList();
+  } catch (err) { alert(err.message); }
 }
 
 async function loadSavedOperatorCount() {
@@ -737,6 +778,29 @@ $("clDownloadRtpAllM3u").addEventListener("click", function() { doExportDownload
 $("clDownloadJson").addEventListener("click", function() { doExportDownload("channels.json", this); });
 $("clDownloadTxt").addEventListener("click", function() { doExportDownload("channels.txt", this); });
 $("clDownloadCsv").addEventListener("click", function() { doExportDownload("channels.csv", this); });
+$("channelEditCancel").addEventListener("click", closeChannelEdit);
+$("channelEditRestoreOriginal").addEventListener("click", () => restoreChannelMetadata("original"));
+$("channelEditRestoreEdited").addEventListener("click", () => restoreChannelMetadata("edited"));
+$("channelEditForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!activeChannelEditKey) return;
+  const btn = $("channelEditSave");
+  btn.disabled = true;
+  try {
+    await requestJson(`/api/channels/${encodeURIComponent(activeChannelEditKey)}/metadata`, {
+      method: "POST",
+      body: JSON.stringify({
+        name: $("channelEditName").value.trim(),
+        category: $("channelEditCategory").value.trim(),
+        tvg_id: $("channelEditEpgId").value.trim(),
+        is_hd: $("channelEditHd").checked,
+      }),
+    });
+    await loadChannelList();
+    closeChannelEdit();
+  } catch (err) { alert(err.message); }
+  finally { btn.disabled = false; }
+});
 $("clSelectAll").addEventListener("change", function() {
   visibleFlatKeys().forEach((key) => setChannelSelected(key, this.checked));
   refreshChannelSelectionControls();
