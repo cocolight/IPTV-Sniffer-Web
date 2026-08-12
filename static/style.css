@@ -41,7 +41,7 @@ body {
 .top-subtitle { margin: 6px 0 0; color: rgba(255, 255, 255, .82); line-height: 1.45; max-width: 620px; }
 .eyebrow { font-size: 12px; letter-spacing: 0; text-transform: uppercase; opacity: .9; }
 .version { margin-left: 8px; font-weight: 700; }
-.top-actions, .button-row, .toolbar, .logs-actions, .home-actions, .preview-actions, .source-links, .form-actions {
+.top-actions, .button-row, .toolbar, .logs-actions, .preview-actions, .source-links, .form-actions {
   display: flex;
   gap: 8px;
   flex-wrap: wrap;
@@ -110,10 +110,23 @@ body {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 18px;
-  align-items: end;
+  align-items: center;
 }
 .home-hero h2 { margin: 8px 0 0; font-size: 30px; line-height: 1.2; max-width: 760px; }
 .home-hero p { margin: 12px 0 0; color: var(--muted); line-height: 1.6; max-width: 720px; }
+.home-hero-copy { min-width: 0; }
+.home-hero-cta {
+  width: min(270px, 100%);
+  display: grid;
+  gap: 7px;
+  padding: 16px;
+  border: 1px solid #cbd8ff;
+  border-radius: 8px;
+  background: #f5f8ff;
+}
+.home-hero-cta strong { font-size: 16px; }
+.home-hero-cta .primary { width: 100%; margin-top: 4px; }
+.home-hero-step { color: var(--primary-dark); font-size: 12px; font-weight: 750; }
 .home-steps {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -381,6 +394,21 @@ td code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Conso
 .channel-edit-dialog h2 { margin: 0; }
 .dialog-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 2px; }
 .dialog-actions-spacer { flex: 1 1 0; }
+.backup-restore-dialog { width: min(620px, calc(100% - 28px)); }
+.backup-module-list { display: grid; gap: 8px; }
+.backup-module-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  cursor: pointer;
+}
+.backup-module-row input { margin: 0; }
+.backup-module-row small { color: var(--muted); white-space: nowrap; }
 
 .badge { display: inline-flex; min-height: 24px; padding: 0 8px; border-radius: 999px; align-items: center; font-size: 12px; font-weight: 750; }
 .badge.ok { color: var(--ok); background: #e6f5ee; }

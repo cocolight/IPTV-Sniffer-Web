@@ -832,53 +832,168 @@ $("clDeleteSelectedBtn").addEventListener("click", async () => {
 $("clRefreshBtn").addEventListener("click", () => loadChannelList());
 $("clFilterName").addEventListener("input", filterAndRenderChannelList);
 $("clFilterCategory").addEventListener("change", filterAndRenderChannelList);
-$("backupExportBtn").addEventListener("click", async () => {
-  const btn = $("backupExportBtn");
-  btn.disabled = true;
-  try {
-    const resp = await fetch("/api/backup/export");
-    if (!resp.ok) throw new Error(`导出失败：${resp.status}`);
-    const blob = await resp.blob();
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    const ts = formatTimestampUtc8(new Date());
-    a.href = url; a.download = `iptv-sniffer-backup-${ts}.json`;
-    document.body.appendChild(a); a.click();
-    document.body.removeChild(a); URL.revokeObjectURL(url);
-    const box = $("backupStatus");
-    box.hidden = false; box.className = "result-box ok";
-    box.textContent = "配置已导出到本地文件。";
-  } catch (err) {
-    const box = $("backupStatus");
-    box.hidden = false; box.className = "result-box error";
-    box.textContent = `导出失败：${err.message}`;
-  } finally { btn.disabled = false; }
-});
+$("backupExportBtn").addEventListener("click", () => showBackupExportDialog());
 $("backupImportBtn").addEventListener("click", () => {
   $("backupImportFile").value = "";
   $("backupImportFile").click();
 });
+
+const BACKUP_MODULES = [
+  ["settings", "应用与导出设置"],
+  ["channels", "频道线路"],
+  ["operator_channels", "运营商频道表"],
+  ["discovered_channels", "已发现频道"],
+  ["fcc", "FCC 记录"],
+  ["stb_token", "机顶盒认证信息"],
+  ["iptv_auth_backups", "IPTV 认证备份"],
+  ["channel_snapshots", "频道列表快照"],
+];
+let pendingGlobalBackup = null;
+let pendingAuthBackupConflicts = [];
+
+function updateBackupExportConfirmState() {
+  $("backupExportConfirm").disabled = !document.querySelector("#backupExportModules input:checked");
+}
+
+function showBackupExportDialog() {
+  $("backupExportModules").innerHTML = BACKUP_MODULES.map(([key, label]) => `
+    <label class="backup-module-row">
+      <input type="checkbox" value="${escapeHtml(key)}" checked>
+      <span>${escapeHtml(label)}</span>
+    </label>`).join("");
+  $("backupExportModules").querySelectorAll("input").forEach((input) => input.addEventListener("change", updateBackupExportConfirmState));
+  updateBackupExportConfirmState();
+  $("backupExportDialog").showModal();
+}
+
+function backupModuleDetail(key, value) {
+  if (key === "channels" || key === "operator_channels" || key === "discovered_channels" || key === "fcc") {
+    return `${Object.keys(value || {}).length} 条`;
+  }
+  if (key === "iptv_auth_backups") {
+    return `${Object.keys(value?.interfaces || {}).length} 个接口`;
+  }
+  if (key === "channel_snapshots") return `${Object.keys(value || {}).length} 个快照`;
+  return "已包含";
+}
+
+function updateBackupRestoreConfirmState() {
+  $("backupRestoreConfirm").disabled = !document.querySelector("#backupRestoreModules input:checked");
+}
+
+function showBackupRestoreDialog(backup, filename, authConflicts = []) {
+  const modules = BACKUP_MODULES.filter(([key]) => backup[key] !== null && backup[key] !== undefined);
+  if (!modules.length) throw new Error("不是可恢复的全局备份文件");
+  pendingGlobalBackup = backup;
+  pendingAuthBackupConflicts = authConflicts;
+  const version = backup._app_version ? `，来自 v${backup._app_version}` : "";
+  $("backupRestoreSummary").textContent = `文件：${filename}${version}。请选择要恢复的模块；未勾选的内容不会被修改。`;
+  $("backupRestoreModules").innerHTML = modules.map(([key, label]) => {
+    const hasAuthConflict = key === "iptv_auth_backups" && authConflicts.length > 0;
+    const detail = hasAuthConflict
+      ? `与本机 ${authConflicts.join("、")} 快照冲突，需明确勾选才覆盖`
+      : backupModuleDetail(key, backup[key]);
+    return `
+    <label class="backup-module-row">
+      <input type="checkbox" value="${escapeHtml(key)}" ${hasAuthConflict ? "" : "checked"}>
+      <span>${escapeHtml(label)}</span>
+      <small>${escapeHtml(detail)}</small>
+    </label>`;
+  }).join("");
+  $("backupRestoreModules").querySelectorAll("input").forEach((input) => input.addEventListener("change", updateBackupRestoreConfirmState));
+  updateBackupRestoreConfirmState();
+  $("backupRestoreDialog").showModal();
+}
+
 $("backupImportFile").addEventListener("change", async function () {
   const file = this.files[0];
   if (!file) return;
-  const btn = $("backupImportBtn");
-  btn.disabled = true; btn.textContent = "导入中…";
-  const box = $("backupStatus");
-  box.hidden = false; box.className = "result-box warning";
-  box.textContent = "正在导入，请稍候…";
   try {
     const text = await file.text();
-    const data = JSON.parse(text);
-    const result = await requestJson("/api/backup/import", {method: "POST", body: JSON.stringify(data)});
+    const inspection = await requestJson("/api/backup/inspect", {
+      method: "POST", body: JSON.stringify({backup: JSON.parse(text)}),
+    });
+    showBackupRestoreDialog(inspection.backup, file.name, inspection.auth_conflicts || []);
+  } catch (err) {
+    const box = $("backupStatus");
+    box.hidden = false; box.className = "result-box error";
+    box.textContent = `无法读取备份：${err.message}`;
+  }
+});
+$("backupRestoreCancel").addEventListener("click", () => $("backupRestoreDialog").close());
+$("backupRestoreSelectAll").addEventListener("click", () => {
+  document.querySelectorAll("#backupRestoreModules input").forEach((input) => { input.checked = true; });
+  updateBackupRestoreConfirmState();
+});
+$("backupRestoreClearAll").addEventListener("click", () => {
+  document.querySelectorAll("#backupRestoreModules input").forEach((input) => { input.checked = false; });
+  updateBackupRestoreConfirmState();
+});
+$("backupRestoreForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const modules = [...document.querySelectorAll("#backupRestoreModules input:checked")].map((input) => input.value);
+  if (!pendingGlobalBackup || !modules.length) return;
+  const btn = $("backupRestoreConfirm");
+  const box = $("backupStatus");
+  btn.disabled = true;
+  box.hidden = false; box.className = "result-box warning";
+  box.textContent = "正在恢复所选模块…";
+  try {
+    const result = await requestJson("/api/backup/import", {
+      method: "POST", body: JSON.stringify({
+        backup: pendingGlobalBackup,
+        modules,
+        overwrite_auth_backups: modules.includes("iptv_auth_backups") && pendingAuthBackupConflicts.length > 0,
+      }),
+    });
+    $("backupRestoreDialog").close();
+    pendingGlobalBackup = null;
+    pendingAuthBackupConflicts = [];
     box.className = "result-box ok";
-    box.textContent = `导入完成：已恢复 ${result.restored.join("、") || "无"}；跳过 ${result.skipped.join("、") || "无"}。页面将在 2 秒后刷新。`;
+    box.textContent = `恢复完成：${result.restored.join("、") || "无"}${result.skipped.length ? `；备份中没有：${result.skipped.join("、")}` : ""}。页面将在 2 秒后刷新。`;
     loadSavedOperatorCount().catch(() => {});
     loadIptvAuthSummary().catch(() => {});
     setTimeout(() => location.reload(), 2000);
   } catch (err) {
     box.className = "result-box error";
-    box.textContent = `导入失败：${err.message}`;
-  } finally { btn.disabled = false; btn.textContent = "导入本地配置"; }
+    box.textContent = `恢复失败：${err.message}`;
+  } finally { btn.disabled = false; }
+});
+$("backupExportCancel").addEventListener("click", () => $("backupExportDialog").close());
+$("backupExportSelectAll").addEventListener("click", () => {
+  document.querySelectorAll("#backupExportModules input").forEach((input) => { input.checked = true; });
+  updateBackupExportConfirmState();
+});
+$("backupExportClearAll").addEventListener("click", () => {
+  document.querySelectorAll("#backupExportModules input").forEach((input) => { input.checked = false; });
+  updateBackupExportConfirmState();
+});
+$("backupExportForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const modules = [...document.querySelectorAll("#backupExportModules input:checked")].map((input) => input.value);
+  if (!modules.length) return;
+  const btn = $("backupExportConfirm");
+  const box = $("backupStatus");
+  btn.disabled = true;
+  try {
+    const resp = await fetch("/api/backup/export", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({modules})});
+    if (!resp.ok) {
+      const data = await resp.json().catch(() => ({}));
+      throw new Error(data.error || `导出失败：${resp.status}`);
+    }
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = `iptv-sniffer-backup-${formatTimestampUtc8(new Date())}.json`;
+    document.body.appendChild(a); a.click();
+    document.body.removeChild(a); URL.revokeObjectURL(url);
+    $("backupExportDialog").close();
+    box.hidden = false; box.className = "result-box ok";
+    box.textContent = `备份已导出：${modules.map((key) => BACKUP_MODULES.find((item) => item[0] === key)?.[1] || key).join("、")}。`;
+  } catch (err) {
+    box.hidden = false; box.className = "result-box error";
+    box.textContent = `导出失败：${err.message}`;
+  } finally { btn.disabled = false; }
 });
 $("backupClearAllBtn")?.addEventListener("click", async () => {
   const CLEAR_ALL_CONFIRM_TEXT = "确认清除";
@@ -1481,53 +1596,6 @@ $("iptvTcWatchSaveBtn").addEventListener("click", saveIptvTcWatch);
 $("iptvTcWatchRefreshBtn").addEventListener("click", refreshIptvTcWatchStatus);
 $("iptvAuthIface").addEventListener("change", refreshIptvAuthStatus);
 
-$("iptvAuthExportBtn").addEventListener("click", async function () {
-  const iface = $("iptvAuthIface").value;
-  if (!iface) { alert("请先选择 IPTV 上游接口。"); return; }
-  const btn = this;
-  btn.disabled = true;
-  try {
-    const data = await requestJson(`/api/iptv-auth/backup-export?interface=${encodeURIComponent(iface)}`);
-    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `iptv-auth-backup-${iface}.json`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-  } catch (e) {
-    alert("导出失败：" + e.message);
-  } finally {
-    btn.disabled = false;
-  }
-});
-
-$("iptvAuthImportBtn").addEventListener("click", function () {
-  $("iptvAuthImportFile").value = "";
-  $("iptvAuthImportFile").click();
-});
-
-$("iptvAuthImportFile").addEventListener("change", async function () {
-  const file = this.files[0];
-  if (!file) return;
-  const btn = $("iptvAuthImportBtn");
-  btn.disabled = true;
-  try {
-    const text = await file.text();
-    const data = JSON.parse(text);
-    const res = await requestJson("/api/iptv-auth/backup-import", { method: "POST", body: JSON.stringify(data) });
-    let msg = `接口 ${data.interface} 的初始备份已导入，恢复功能现在可用。`;
-    if (res.warn_no_ipv4) msg += "\n\n⚠️ 注意：此备份捕获时网卡尚无 IPv4 地址，执行恢复后将自动尝试普通 DHCP 补救，若失败需手动配置 IP。";
-    alert(msg);
-    await refreshIptvAuthStatus();
-  } catch (e) {
-    alert("导入失败：" + e.message);
-  } finally {
-    btn.disabled = false;
-  }
-});
 // ── Playback diagnostics tab ──────────────────────────────────────────────
 
 function initDiagnoseTab() {

@@ -937,10 +937,12 @@ _BACKUP_FILES: list[tuple[str, Path]] = [
 ]
 
 
-@app.get("/api/backup/export")
-def api_backup_export():
+def _global_backup_response(selected: list[str] | None = None) -> Response:
+    selected_keys = set(selected or [key for key, _ in _BACKUP_FILES])
     payload: dict[str, Any] = {"_version": _BACKUP_VERSION, "_app_version": APP_VERSION, "_exported_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
     for key, path in _BACKUP_FILES:
+        if key not in selected_keys:
+            continue
         if key == "settings":
             payload[key] = settings_store.load()
             continue
@@ -956,15 +958,98 @@ def api_backup_export():
     )
 
 
+def _normalize_global_backup_payload(data: dict[str, Any]) -> dict[str, Any]:
+    """Normalize legacy per-interface auth exports into the global backup schema."""
+    payload = data.get("backup") if isinstance(data.get("backup"), dict) else data
+    if not isinstance(payload, dict):
+        raise ValueError("格式错误：备份内容必须是 JSON 对象")
+    legacy_iface = str(payload.get("interface") or "").strip()
+    legacy_initial = payload.get("initial")
+    if legacy_iface and isinstance(legacy_initial, dict) and "iptv_auth_backups" not in payload:
+        return {
+            "_version": _BACKUP_VERSION,
+            "_app_version": str(payload.get("_app_version") or ""),
+            "_exported_at": str(payload.get("_exported_at") or ""),
+            "iptv_auth_backups": {
+                "interfaces": {legacy_iface: {"initial": legacy_initial, "history": []}},
+            },
+        }
+    return payload
+
+
+def _auth_backup_conflicts(payload: dict[str, Any]) -> list[str]:
+    incoming = payload.get("iptv_auth_backups")
+    incoming_interfaces = incoming.get("interfaces") if isinstance(incoming, dict) else {}
+    existing_interfaces = iptv_auth_service._backup_data().get("interfaces", {})
+    if not isinstance(incoming_interfaces, dict) or not isinstance(existing_interfaces, dict):
+        return []
+    return sorted(
+        iface for iface, entry in incoming_interfaces.items()
+        if isinstance(entry, dict) and entry.get("initial")
+        and isinstance(existing_interfaces.get(str(iface)), dict)
+        and existing_interfaces[str(iface)].get("initial")
+    )
+
+
+@app.get("/api/backup/export")
+def api_backup_export():
+    return _global_backup_response()
+
+
+@app.post("/api/backup/export")
+def api_backup_export_selected():
+    data = request.get_json(silent=True) or {}
+    modules = data.get("modules") if isinstance(data, dict) else None
+    known = {key for key, _ in _BACKUP_FILES}
+    if not isinstance(modules, list):
+        return api_error("modules 必须是数组", 400)
+    selected = [str(key) for key in modules if str(key) in known]
+    if not selected:
+        return api_error("请至少选择一个要备份的模块", 400)
+    return _global_backup_response(selected)
+
+
+@app.post("/api/backup/inspect")
+def api_backup_inspect():
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return api_error("格式错误：需要 JSON 对象")
+    try:
+        payload = _normalize_global_backup_payload(data)
+    except ValueError as exc:
+        return api_error(str(exc))
+    available = [key for key, _ in _BACKUP_FILES if payload.get(key) is not None]
+    if not available:
+        return api_error("不是可恢复的全局备份文件")
+    return api_success({"backup": payload, "available": available, "auth_conflicts": _auth_backup_conflicts(payload)})
+
+
 @app.post("/api/backup/import")
 def api_backup_import():
     data = request.get_json(silent=True) or {}
     if not isinstance(data, dict):
         return api_error("格式错误：需要 JSON 对象")
+    try:
+        payload = _normalize_global_backup_payload(data)
+    except ValueError as exc:
+        return api_error(str(exc))
+    selected = data.get("modules") if isinstance(data.get("modules"), list) else None
+    known = {key for key, _ in _BACKUP_FILES}
+    if selected is None:
+        selected_keys = [key for key, _ in _BACKUP_FILES]
+    else:
+        selected_keys = [str(key) for key in selected if str(key) in known]
+        if not selected_keys:
+            return api_error("请至少选择一个要恢复的模块", 400)
+    auth_conflicts = _auth_backup_conflicts(payload)
+    if "iptv_auth_backups" in selected_keys and auth_conflicts and not bool(data.get("overwrite_auth_backups", False)):
+        return api_error(f"认证备份与本机接口快照冲突：{', '.join(auth_conflicts)}。请明确确认覆盖后再恢复。", 409)
     restored: list[str] = []
     skipped: list[str] = []
     for key, path in _BACKUP_FILES:
-        value = data.get(key)
+        if key not in selected_keys:
+            continue
+        value = payload.get(key)
         if value is None:
             skipped.append(key)
             continue
@@ -976,8 +1061,8 @@ def api_backup_import():
             skipped.append(key)
     if "operator_channels" in restored:
         operator_channel_store.invalidate()
-    logger.info(f"备份导入完成：已恢复 {len(restored)} 项，跳过 {len(skipped)} 项")
-    return api_success({"restored": restored, "skipped": skipped})
+    logger.info(f"全局备份导入完成：已恢复 {len(restored)} 项，跳过 {len(skipped)} 项")
+    return api_success({"restored": restored, "skipped": skipped, "selected": selected_keys})
 
 
 @app.post("/api/backup/clear-all")

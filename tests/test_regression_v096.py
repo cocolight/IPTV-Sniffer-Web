@@ -981,3 +981,54 @@ def test_channel_metadata_api_rejects_empty_name_and_restores(tmp_path):
         assert restored.get_json()["data"]["channel"]["name"] == "CCTV1"
     finally:
         app_module.channel_store = original_store
+
+
+def test_global_backup_selects_modules_and_keeps_legacy_auth_compatible(tmp_path, monkeypatch):
+    settings_path = tmp_path / "settings.json"
+    channels_path = tmp_path / "channels.json"
+    auth_path = tmp_path / "iptv-auth.json"
+    monkeypatch.setattr(app_module, "_BACKUP_FILES", [
+        ("settings", settings_path),
+        ("channels", channels_path),
+        ("iptv_auth_backups", auth_path),
+    ])
+    monkeypatch.setattr(app_module.iptv_auth_service, "backup_path", auth_path)
+    auth_path.write_text(json.dumps({"interfaces": {"enp3s0": {"initial": {"mac": "old"}}}}), encoding="utf-8")
+    client = app_module.app.test_client()
+
+    exported = client.post("/api/backup/export", json={"modules": ["channels"]})
+    assert exported.status_code == 200
+    assert "channels" in json.loads(exported.data)
+    assert "settings" not in json.loads(exported.data)
+
+    legacy_auth = {"interface": "enp3s0", "initial": {"mac": "new", "ipv4": []}}
+    inspected = client.post("/api/backup/inspect", json={"backup": legacy_auth})
+    assert inspected.status_code == 200
+    assert inspected.get_json()["data"]["auth_conflicts"] == ["enp3s0"]
+
+    blocked = client.post("/api/backup/import", json={
+        "backup": legacy_auth, "modules": ["iptv_auth_backups"],
+    })
+    assert blocked.status_code == 409
+    restored = client.post("/api/backup/import", json={
+        "backup": legacy_auth, "modules": ["iptv_auth_backups"], "overwrite_auth_backups": True,
+    })
+    assert restored.status_code == 200
+    assert json.loads(auth_path.read_text(encoding="utf-8"))["interfaces"]["enp3s0"]["initial"]["mac"] == "new"
+
+
+def test_global_backup_restores_only_selected_module(tmp_path, monkeypatch):
+    settings_path = tmp_path / "settings.json"
+    channels_path = tmp_path / "channels.json"
+    monkeypatch.setattr(app_module, "_BACKUP_FILES", [
+        ("settings", settings_path),
+        ("channels", channels_path),
+    ])
+    client = app_module.app.test_client()
+    result = client.post("/api/backup/import", json={
+        "backup": {"settings": {"http_port": 5140}, "channels": {"239.1.1.1:8001": {"name": "CCTV1"}}},
+        "modules": ["channels"],
+    })
+    assert result.status_code == 200
+    assert json.loads(channels_path.read_text(encoding="utf-8"))["239.1.1.1:8001"]["name"] == "CCTV1"
+    assert not settings_path.exists()
