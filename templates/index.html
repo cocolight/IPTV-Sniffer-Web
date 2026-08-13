@@ -152,14 +152,14 @@
 
           <section class="card">
             <div class="section-title">
-              <h2>全局备份</h2>
-              <span class="muted small">统一备份频道线路、运营商频道表、认证、设置与快照</span>
+              <h2>导入与全局备份</h2>
+              <span class="muted small">支持导入频道、备份、设置、认证与快照</span>
             </div>
-            <p class="task-description">恢复时可选择具体模块；频道线路和运营商频道表均包含在全局备份中。</p>
+            <p class="task-description">可导入本应用之前导出的 M3U 或 channels.json 频道列表；选择全局备份 JSON 时，可按需恢复频道、设置、认证与快照等模块。</p>
             <div class="button-row">
               <button id="backupExportBtn" class="secondary" type="button">导出到本地</button>
-              <button id="backupImportBtn" class="secondary" type="button">恢复全局备份</button>
-              <input id="backupImportFile" type="file" accept=".json" class="hidden-control">
+              <button id="backupImportBtn" class="secondary" type="button">导入频道 / 恢复备份</button>
+              <input id="backupImportFile" type="file" accept=".m3u,.m3u8,.json,application/json,audio/x-mpegurl,application/vnd.apple.mpegurl" class="hidden-control">
               <button id="backupClearAllBtn" class="danger" type="button">清除所有配置</button>
             </div>
             <div id="backupStatus" class="result-box muted" hidden></div>

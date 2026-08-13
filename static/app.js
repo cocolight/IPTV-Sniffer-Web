@@ -908,16 +908,32 @@ function showBackupRestoreDialog(backup, filename, authConflicts = []) {
 $("backupImportFile").addEventListener("change", async function () {
   const file = this.files[0];
   if (!file) return;
+  const box = $("backupStatus");
   try {
     const text = await file.text();
-    const inspection = await requestJson("/api/backup/inspect", {
-      method: "POST", body: JSON.stringify({backup: JSON.parse(text)}),
+    if (file.name.toLowerCase().endsWith(".json")) {
+      try {
+        const inspection = await requestJson("/api/backup/inspect", {
+          method: "POST", body: JSON.stringify({backup: JSON.parse(text)}),
+        });
+        showBackupRestoreDialog(inspection.backup, file.name, inspection.auth_conflicts || []);
+        return;
+      } catch (_) {
+        // channels.json is also JSON, but is a channel export rather than a global backup.
+      }
+    }
+    box.hidden = false; box.className = "result-box warning";
+    box.textContent = "正在导入频道列表…";
+    const result = await requestJson("/api/channels/import-export", {
+      method: "POST", body: JSON.stringify({content: text, filename: file.name}),
     });
-    showBackupRestoreDialog(inspection.backup, file.name, inspection.auth_conflicts || []);
+    box.className = "result-box ok";
+    box.textContent = `频道列表导入完成：新增或更新 ${result.saved} 条${result.skipped ? `，跳过 ${result.skipped} 条不支持的记录` : ""}。`;
+    state.channelListSection = "list";
+    showTab("channelList");
   } catch (err) {
-    const box = $("backupStatus");
     box.hidden = false; box.className = "result-box error";
-    box.textContent = `无法读取备份：${err.message}`;
+    box.textContent = `导入失败：${err.message}`;
   }
 });
 $("backupRestoreCancel").addEventListener("click", () => $("backupRestoreDialog").close());

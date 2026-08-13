@@ -31,7 +31,13 @@ from services.iptv_auth_service import IptvAuthService
 import services.iptv_auth_service as iptv_auth_module
 from services.log_service import AppLogger
 import app as app_module
-from app import _parse_rtp2httpd_config_text, can_replace_with_epg_name, fill_channel_name_from_metadata
+from app import (
+    _parse_rtp2httpd_config_text,
+    can_replace_with_epg_name,
+    fill_channel_name_from_metadata,
+    parse_exported_channels_json,
+    parse_exported_m3u_channels,
+)
 from services.epg_service import EpgService, normalize_channel_name
 from services.storage_service import ChannelStore
 from utils import channel_group_key, redact_sensitive_text
@@ -1032,3 +1038,60 @@ def test_global_backup_restores_only_selected_module(tmp_path, monkeypatch):
     assert result.status_code == 200
     assert json.loads(channels_path.read_text(encoding="utf-8"))["239.1.1.1:8001"]["name"] == "CCTV1"
     assert not settings_path.exists()
+
+
+def test_imports_previously_exported_rtp2httpd_m3u(tmp_path):
+    rows, skipped = parse_exported_m3u_channels(
+        '#EXTM3U\n'
+        '#EXTINF:-1 tvg-id="CCTV1" tvg-name="CCTV1" group-title="央视频道",CCTV1 综合\n'
+        'rtp://239.1.1.1:8001?fcc=10.7.10.172:8027&fec=8000\n'
+        '#EXTINF:-1,Not a multicast source\n'
+        'https://example.com/live.m3u8\n'
+    )
+    assert len(rows) == 1
+    assert skipped == 1
+    assert rows[0] == {
+        "key": "239.1.1.1:8001", "host": "239.1.1.1", "port": 8001,
+        "name": "CCTV1 综合", "category": "央视频道", "tvg_id": "CCTV1",
+        "tvg_name": "CCTV1", "tvg_logo": "", "fcc_ip": "10.7.10.172",
+        "fcc_port": 8027, "fec_port": 8000,
+    }
+
+
+def test_imports_player_m3u_and_exported_channels_json():
+    player_rows, skipped = parse_exported_m3u_channels(
+        '#EXTINF:-1 group-title="卫视频道",北京卫视\n'
+        'http://nas.local:5140/rtp/239.2.2.2:8002?fcc=10.7.10.172:8027\n'
+    )
+    assert skipped == 0
+    assert player_rows[0]["host"] == "239.2.2.2"
+    assert player_rows[0]["fcc_port"] == 8027
+
+    json_rows, json_skipped = parse_exported_channels_json({
+        "CCTV1": {
+            "tvg_id": "CCTV1", "tvg_name": "CCTV1", "group_title": "央视频道",
+            "is_hd": True,
+            "live": {"local-multicast": {"addr": "rtp://239.3.3.3:8003?fec=8002"}},
+            "sniffer": {"key": "239.3.3.3:8003", "fcc": "10.7.10.172:8027", "packets": 12},
+        },
+    })
+    assert json_skipped == 0
+    assert json_rows[0]["name"] == "CCTV1"
+    assert json_rows[0]["fcc_ip"] == "10.7.10.172"
+    assert json_rows[0]["fec_port"] == 8002
+
+
+def test_channel_export_import_api_saves_m3u(tmp_path):
+    original_store = app_module.channel_store
+    try:
+        app_module.channel_store = ChannelStore(tmp_path / "channels.json")
+        client = app_module.app.test_client()
+        result = client.post("/api/channels/import-export", json={
+            "filename": "channels-rtp2httpd-all.m3u",
+            "content": '#EXTINF:-1 group-title="央视频道",CCTV1\nrtp://239.4.4.4:8004?fcc=10.7.10.172:8027\n',
+        })
+        assert result.status_code == 200
+        assert result.get_json()["data"]["saved"] == 1
+        assert app_module.channel_store.get("239.4.4.4:8004")["name"] == "CCTV1"
+    finally:
+        app_module.channel_store = original_store
