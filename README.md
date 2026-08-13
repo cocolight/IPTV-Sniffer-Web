@@ -37,7 +37,7 @@ docker run -d \
   -e TZ=Asia/Shanghai \
   -v $(pwd)/data:/app/data \
   -v $(pwd)/output:/app/output \
-  roninriddle/iptv-sniffer-web:1.2.6
+  roninriddle/iptv-sniffer-web:1.2.9
 ```
 
 打开：
