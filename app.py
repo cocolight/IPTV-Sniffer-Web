@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, urlsplit
 from urllib.request import Request, urlopen
 
 from flask import Flask, Response, jsonify, render_template, request, send_file, send_from_directory
@@ -593,6 +594,122 @@ def parse_m3u_channels(text: str) -> list[dict[str, Any]]:
             items.append(current)
             current = None
     return items
+
+
+def _safe_import_port(value: Any) -> int | None:
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        return None
+    return port if 1 <= port <= 65535 else None
+
+
+def _parse_playlist_stream_url(url: str) -> tuple[str, int, dict[str, list[str]]] | None:
+    """Extract a multicast source from this app's exported M3U URL formats."""
+    parsed = urlsplit(str(url or "").strip())
+    host = parsed.hostname or ""
+    try:
+        port = _safe_import_port(parsed.port)
+    except ValueError:
+        port = None
+    if parsed.scheme.lower() in {"rtp", "udp", "igmp"} and host and port:
+        return host, port, parse_qs(parsed.query)
+
+    # Player playlists use rtp2httpd URLs such as
+    # http://host:5140/rtp/239.1.1.1:8001?fcc=10.0.0.1:8027&fec=8000.
+    path_parts = [part for part in parsed.path.split("/") if part]
+    if parsed.scheme.lower() in {"http", "https"} and len(path_parts) >= 2 and path_parts[-2].lower() in {"rtp", "udp", "igmp"}:
+        stream_host, separator, stream_port = path_parts[-1].rpartition(":")
+        resolved_port = _safe_import_port(stream_port) if separator else None
+        if stream_host and resolved_port:
+            return stream_host, resolved_port, parse_qs(parsed.query)
+    return None
+
+
+def _playlist_item_to_channel_row(item: dict[str, Any]) -> dict[str, Any] | None:
+    parsed = _parse_playlist_stream_url(str(item.get("url") or ""))
+    if not parsed:
+        return None
+    host, port, query = parsed
+    if not valid_ipv4_multicast(host):
+        return None
+    attrs = item.get("attrs") if isinstance(item.get("attrs"), dict) else {}
+    name = str(item.get("title") or attrs.get("tvg-name") or attrs.get("tvg-id") or "").strip()
+    if not name:
+        return None
+    fcc = str((query.get("fcc") or [""])[0]).strip()
+    fcc_host, separator, fcc_port_text = fcc.rpartition(":")
+    fcc_port = _safe_import_port(fcc_port_text) if separator else None
+    fec_port = _safe_import_port((query.get("fec") or [None])[0])
+    return {
+        "key": f"{host}:{port}",
+        "host": host,
+        "port": port,
+        "name": name,
+        "category": str(attrs.get("group-title") or classify_channel_name(name)).strip(),
+        "tvg_id": str(attrs.get("tvg-id") or "").strip(),
+        "tvg_name": str(attrs.get("tvg-name") or "").strip(),
+        "tvg_logo": str(attrs.get("tvg-logo") or "").strip(),
+        "fcc_ip": fcc_host.strip() if fcc_port else "",
+        "fcc_port": fcc_port,
+        "fec_port": fec_port,
+    }
+
+
+def parse_exported_m3u_channels(text: str) -> tuple[list[dict[str, Any]], int]:
+    """Parse channels exported by this application, retaining usable M3U metadata."""
+    items = parse_m3u_channels(text)
+    rows = [row for item in items if (row := _playlist_item_to_channel_row(item))]
+    return rows, len(items) - len(rows)
+
+
+def parse_exported_channels_json(data: Any) -> tuple[list[dict[str, Any]], int]:
+    """Parse the channels.json format written by ExportService."""
+    if isinstance(data, list):
+        rows = [dict(item) for item in data if isinstance(item, dict)]
+        return rows, len(data) - len(rows)
+    if not isinstance(data, dict):
+        raise ValueError("频道列表 JSON 必须是对象或数组")
+    rows: list[dict[str, Any]] = []
+    skipped = 0
+    for name, item in data.items():
+        if not isinstance(item, dict):
+            skipped += 1
+            continue
+        live = item.get("live") if isinstance(item.get("live"), dict) else {}
+        source = live.get("local-multicast") if isinstance(live.get("local-multicast"), dict) else {}
+        parsed = _parse_playlist_stream_url(str(source.get("addr") or ""))
+        if not parsed:
+            skipped += 1
+            continue
+        host, port, query = parsed
+        if not valid_ipv4_multicast(host):
+            skipped += 1
+            continue
+        sniffer = item.get("sniffer") if isinstance(item.get("sniffer"), dict) else {}
+        fcc = str(sniffer.get("fcc") or (query.get("fcc") or [""])[0]).strip()
+        fcc_host, separator, fcc_port_text = fcc.rpartition(":")
+        fcc_port = _safe_import_port(fcc_port_text) if separator else None
+        rows.append({
+            "key": str(sniffer.get("key") or f"{host}:{port}"),
+            "host": host,
+            "port": port,
+            "name": str(name or item.get("tvg_name") or item.get("tvg_id") or "").strip(),
+            "category": str(item.get("group_title") or classify_channel_name(str(name))).strip(),
+            "tvg_id": str(item.get("tvg_id") or "").strip(),
+            "tvg_name": str(item.get("tvg_name") or "").strip(),
+            "tvg_logo": str(item.get("tvg_logo") or "").strip(),
+            "epg_source": str(item.get("epg_source") or "").strip(),
+            "is_hd": bool(item.get("is_hd", False)),
+            "packets": sniffer.get("packets", 0),
+            "codec_name": str(sniffer.get("codec") or ""),
+            "width": sniffer.get("width"),
+            "height": sniffer.get("height"),
+            "fcc_ip": fcc_host.strip() if fcc_port else "",
+            "fcc_port": fcc_port,
+            "fec_port": _safe_import_port(sniffer.get("fec") or (query.get("fec") or [None])[0]),
+        })
+    return rows, skipped
 
 
 def safe_m3u_attr(value: Any) -> str:
@@ -1252,6 +1369,34 @@ def api_channels_save():
     result = channel_store.save_rows(rows)
     logger.info(f"已导入频道列表：新增或更新 {result['saved']} 条，删除 {result['deleted']} 条")
     return api_success(result)
+
+
+@app.post("/api/channels/import-export")
+def api_channels_import_export():
+    """Import a previously exported M3U playlist or channels.json file."""
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return api_error("请求体格式不正确")
+    content = data.get("content")
+    if not isinstance(content, str) or not content.strip():
+        return api_error("请选择非空的频道列表文件")
+    filename = str(data.get("filename") or "").strip()
+    try:
+        if filename.lower().endswith(".json"):
+            rows, skipped = parse_exported_channels_json(json.loads(content))
+            source_type = "JSON"
+        else:
+            rows, skipped = parse_exported_m3u_channels(content)
+            source_type = "M3U"
+    except json.JSONDecodeError:
+        return api_error("频道列表 JSON 格式错误", 400)
+    except ValueError as exc:
+        return api_error(str(exc), 400)
+    if not rows:
+        return api_error("未找到可导入的 IPv4 组播频道；请使用本应用导出的 M3U 或 channels.json 文件", 400)
+    result = channel_store.save_rows(rows)
+    logger.info(f"已从导出的{source_type} 频道列表导入 {result['saved']} 条，跳过 {skipped} 条")
+    return api_success({**result, "skipped": skipped, "source_type": source_type})
 
 
 @app.post("/api/channels/<path:channel_key>/metadata")

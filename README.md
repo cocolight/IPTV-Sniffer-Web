@@ -37,7 +37,7 @@ docker run -d \
   -e TZ=Asia/Shanghai \
   -v $(pwd)/data:/app/data \
   -v $(pwd)/output:/app/output \
-  roninriddle/iptv-sniffer-web:1.2.6
+  roninriddle/iptv-sniffer-web:1.2.9
 ```
 
 打开：
@@ -214,6 +214,7 @@ http://rtp2httpd-host:5140/rtp/239.x.x.x:port
 
 ## 版本记录
 
+- `v1.2.9`：支持通过「导入频道 / 恢复备份」导入本应用此前导出的 M3U（含 rtp2httpd 源文件和播放器列表）及 `channels.json`，用于恢复频道线路；同一入口继续支持按模块恢复全局备份。
 - `v1.2.8`：全局备份统一管理频道线路、运营商频道表、认证快照、设置与快照；导出及恢复均可按模块选择（默认全选），兼容旧版全局备份和单接口认证备份；认证快照与本机同名接口冲突时默认不恢复，须手动确认覆盖；首页改为单一主入口的步骤向导，避免与顶部导航重复；
 - `v1.2.7`：针对 [Issue #3](https://github.com/roninriddle/IPTV-Sniffer-Web/issues/3) 新增频道线路信息自定义编辑：可逐条修改频道名称、分类、EPG 标识与高清标记；自动识别值和上次手工编辑值分别保存，可一键恢复，并在重新导入运营商频道表或重新匹配 EPG 后继续保留手工编辑；JSON 导出同步包含高清标记；
 - `v1.2.6`：针对 [Issue #2](https://github.com/roninriddle/IPTV-Sniffer-Web/issues/2) 的频道名称后续反馈，修复 EPG 单字符频道名参与模糊匹配时覆盖运营商频道名称的问题，避免 CCTV 音乐/少儿、CCTV16 4K SDR、CGTV、CETV4 等未精确匹配的频道被错误显示为 `C`；
