@@ -194,7 +194,7 @@ def _update_backtv_from_channel_text(
             "channel_num": None,
             "is_hd": False,
             "time_shift": True,
-            "time_shift_days": time_shift_minutes,
+            "time_shift_minutes": time_shift_minutes,
             "category": "",
             "operator_group": "",
             "fcc_ip": "",

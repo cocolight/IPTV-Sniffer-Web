@@ -44,7 +44,7 @@ from app import (
     parse_exported_m3u_channels,
 )
 from services.epg_service import EpgService, normalize_channel_name
-from services.storage_service import ChannelStore, StbTokenStore
+from services.storage_service import ChannelStore, LocalSecretStore, StbTokenStore
 from utils import channel_group_key, redact_sensitive_text
 
 
@@ -353,7 +353,7 @@ def test_beijing_unicom_channel_acquire_json_is_parsed():
     assert channels[0]["fcc_port"] == 8027
     assert channels[0]["fec_port"] == 9000
     assert channels[0]["time_shift"] is True
-    assert channels[0]["time_shift_days"] == 14400
+    assert channels[0]["time_shift_minutes"] == 14400
     assert channels[0]["backtv_url"].startswith("rtsp://61.135.88.136/")
     assert channels[0]["is_hd"] is True
     assert channels[0]["category"] == "\u592e\u89c6\u9891\u9053"
@@ -1363,6 +1363,22 @@ def test_global_backup_restores_only_selected_module(tmp_path, monkeypatch):
     assert result.status_code == 200
     assert json.loads(channels_path.read_text(encoding="utf-8"))["239.1.1.1:8001"]["name"] == "CCTV1"
     assert not settings_path.exists()
+
+
+def test_global_backup_and_clear_include_subscription_candidates(tmp_path, monkeypatch):
+    subscription_path = tmp_path / "subscription_candidates.json"
+    subscription_path.write_text(json.dumps({"initialized": True, "candidate_ids": ["c-1001"]}), encoding="utf-8")
+    monkeypatch.setattr(app_module, "_BACKUP_FILES", [("subscription_candidates", subscription_path)])
+    monkeypatch.setattr(app_module, "epg_key_store", LocalSecretStore(tmp_path / "epg-key.secret"))
+    client = app_module.app.test_client()
+
+    exported = client.get("/api/backup/export")
+    assert json.loads(exported.data)["subscription_candidates"]["candidate_ids"] == ["c-1001"]
+
+    cleared = client.post("/api/backup/clear-all", json={"confirm": "确认清除"})
+    assert cleared.status_code == 200
+    assert "subscription_candidates" in cleared.get_json()["data"]["cleared"]
+    assert not subscription_path.exists()
 
 
 def test_imports_previously_exported_rtp2httpd_m3u(tmp_path):

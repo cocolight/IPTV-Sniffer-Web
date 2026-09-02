@@ -477,7 +477,7 @@ def _parse_chanlist_html(html: bytes) -> list[dict[str, Any]]:
         chan_id = pairs.get("ChannelID", "")
         is_hd = pairs.get("IsHDChannel", "0") == "2"
         time_shift = pairs.get("TimeShift", "0") == "1"
-        time_shift_days_s = pairs.get("TimeShiftLength", "")
+        time_shift_minutes_s = pairs.get("TimeShiftLength", "")
         fcc_ip = pairs.get("ChannelFCCIP", "").strip()
         fcc_port_s = pairs.get("ChannelFCCPort", "")
         fcc_addr = (
@@ -522,7 +522,7 @@ def _parse_chanlist_html(html: bytes) -> list[dict[str, Any]]:
                 "channel_id": chan_id,
                 "is_hd": is_hd,
                 "time_shift": time_shift,
-                "time_shift_days": int(time_shift_days_s) if time_shift_days_s.isdigit() else None,
+                "time_shift_minutes": int(time_shift_minutes_s) if time_shift_minutes_s.isdigit() else None,
                 "fcc_ip": fcc_ip,
                 "fcc_port": int(fcc_port_s) if fcc_port_s.isdigit() else None,
                 "fec_port": int(fec_port_s) if fec_port_s.isdigit() else None,
@@ -878,7 +878,7 @@ def _parse_channel_acquire_json(body: bytes) -> list[dict[str, Any]]:
         seen.add(key)
         user_chan_id = _first_text(ch, "userChannelID", "UserChannelID", "channelNO", "channelNum", "num")
         channel_id = _first_text(ch, "channelID", "ChannelID", "id", "ID")
-        time_shift_days = _first_int(ch, "timeShiftLength", "TimeShiftLength", "timeShiftDuration")
+        time_shift_minutes = _first_int(ch, "timeShiftLength", "TimeShiftLength", "timeShiftDuration")
         fcc_ip, fcc_port, fec_port = _parse_stream_params(ch)
         group_name = _first_text(
             ch,
@@ -910,7 +910,7 @@ def _parse_channel_acquire_json(body: bytes) -> list[dict[str, Any]]:
             "user_channel_id": user_chan_id,
             "is_hd": _truthy(_first_text(ch, "isHDChannel", "IsHDChannel", "isHD", "hd")),
             "time_shift": _truthy(_first_text(ch, "timeShift", "TimeShift", "timeshift")),
-            "time_shift_days": time_shift_days,
+            "time_shift_minutes": time_shift_minutes,
             "fcc_ip": fcc_ip,
             "fcc_port": fcc_port,
             "fec_port": fec_port,

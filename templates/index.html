@@ -329,14 +329,14 @@
               <h2>订阅中心</h2>
               <span id="subscriptionCandidateBadge" class="chip neutral">加载中</span>
             </div>
-            <p class="muted small">把频道库中的频道加入候选清单。以下地址固定不变；运营商频道表、FCC 或回看地址刷新后，播放器下次请求会自动使用最新线路。</p>
+            <p class="muted small">把频道库中的频道加入候选清单。以下地址固定不变；运营商频道表、FCC 或回看地址刷新后，播放器下次请求会自动使用最新来源。兼容别名与主订阅内容相同。</p>
             <div class="form-grid compact-grid">
               <label>
                 主订阅（推荐）
                 <div class="copy-field"><input id="subscriptionBestUrl" class="mono" type="text" readonly><button class="secondary copy-subscription-btn" data-subscription-url="best" type="button">复制</button></div>
               </label>
               <label>
-                全部候选订阅
+                兼容别名
                 <div class="copy-field"><input id="subscriptionAllUrl" class="mono" type="text" readonly><button class="secondary copy-subscription-btn" data-subscription-url="all" type="button">复制</button></div>
               </label>
               <label>
@@ -454,7 +454,7 @@
             <div id="catchupSettingsBlock" style="display:none">
               <div class="notice compact">
                 <strong>工作方式：</strong>
-                <span>频道表导入时记录运营商提供的 TimeShiftLength 与 backtv_url；播放器请求回看时访问本机 <code>/hls/&lt;key&gt;/catchup</code>，再由服务端用 ffmpeg 打开 RTSP 回看流并转成 HTTP MPEG-TS。回看服务器在 IPTV 子网，需完成 IPTV 认证后才可访问。</span>
+                <span>频道表导入时记录运营商提供的 TimeShiftLength（分钟）与 backtv_url；动态订阅中的播放器访问稳定 <code>/catchup/&lt;频道ID&gt;</code>，服务端再解析当前回看地址与合法认证状态。联通 HWCU 优先使用兼容 STB 的 RTSP/UDP 会话；其他平台按兼容链路处理。回看服务器在 IPTV 子网，需完成 IPTV 认证后才可访问。</span>
               </div>
               <div class="form-grid">
                 <label>

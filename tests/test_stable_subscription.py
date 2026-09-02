@@ -102,6 +102,27 @@ def test_hls_and_epg_subscriptions_have_fixed_entrypoints(tmp_path, monkeypatch)
     assert epg.headers["Location"] == "https://example.invalid/epg.xml"
 
 
+def test_playlist_all_is_an_explicit_compatibility_alias(tmp_path, monkeypatch):
+    _install_catalog(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    main = client.get("/playlist.m3u", base_url="http://192.168.3.6:8788")
+    alias = client.get("/playlist-all.m3u", base_url="http://192.168.3.6:8788")
+
+    assert main.status_code == alias.status_code == 200
+    assert main.get_data() == alias.get_data()
+
+
+def test_time_shift_minutes_is_canonical_and_old_field_remains_compatible(tmp_path, monkeypatch):
+    _install_catalog(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+    text = client.get("/playlist.m3u", base_url="http://192.168.3.6:8788").get_data(as_text=True)
+
+    # The fixture deliberately uses the pre-1.3.1 name and must still yield
+    # a seven-day catchup attribute during migration.
+    assert 'catchup-days="7"' in text
+
+
 def test_manual_channel_stable_id_survives_metadata_edit(tmp_path):
     store = ChannelStore(tmp_path / "channels.json")
     store.save_rows([{

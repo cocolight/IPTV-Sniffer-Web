@@ -1099,7 +1099,16 @@ def _subscription_entry(stable_id: str, item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _subscription_m3u(include_all: bool = False, hls_compat: bool = False) -> str:
+def _operator_time_shift_minutes(operator: dict[str, Any]) -> int:
+    """Read the canonical minutes field, accepting pre-1.3.1 data."""
+    raw = operator.get("time_shift_minutes", operator.get("time_shift_days", 0))
+    try:
+        return max(0, int(raw or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _subscription_m3u(hls_compat: bool = False) -> str:
     """Build a fast, state-only subscription; never run health checks here."""
     settings = settings_store.load()
     catalog = _stable_channel_catalog()
@@ -1129,9 +1138,9 @@ def _subscription_m3u(include_all: bool = False, hls_compat: bool = False) -> st
         catchup_attr = ""
         backtv = str(operator.get("backtv_url") or "").strip()
         if catchup_enabled and backtv:
-            raw_days = operator.get("time_shift_days") or 0
+            raw_minutes = _operator_time_shift_minutes(operator)
             try:
-                days = max(1, int(raw_days) // 1440) if raw_days else int(settings.get("catchup_days") or 7)
+                days = max(1, raw_minutes // 1440) if raw_minutes else int(settings.get("catchup_days") or 7)
             except (TypeError, ValueError):
                 days = int(settings.get("catchup_days") or 7)
             catchup_source = f"{base_url}/catchup/{stable_id}?playseek=${{(b)yyyyMMddHHmmss:utc}}-${{(e)yyyyMMddHHmmss:utc}}"
@@ -1142,8 +1151,8 @@ def _subscription_m3u(include_all: bool = False, hls_compat: bool = False) -> st
     return "\n".join(lines) + "\n"
 
 
-def _subscription_response(include_all: bool = False, hls_compat: bool = False) -> Response:
-    response = Response(_subscription_m3u(include_all, hls_compat), mimetype="audio/x-mpegurl")
+def _subscription_response(hls_compat: bool = False) -> Response:
+    response = Response(_subscription_m3u(hls_compat), mimetype="audio/x-mpegurl")
     response.headers["Cache-Control"] = "no-store, max-age=0"
     return response
 
@@ -1155,7 +1164,10 @@ def playlist_best_subscription():
 
 @app.get("/playlist-all.m3u")
 def playlist_all_subscription():
-    return _subscription_response(include_all=True)
+    # Compatibility alias.  A durable channel ID always resolves to its one
+    # current source, so this intentionally has the same content as the main
+    # subscription instead of implying non-existent source variants.
+    return _subscription_response()
 
 
 @app.get("/playlist-hls.m3u")
@@ -1477,6 +1489,7 @@ _BACKUP_FILES: list[tuple[str, Path]] = [
     ("stb_token", STB_TOKEN_FILE),
     ("iptv_auth_backups", IPTV_AUTH_BACKUP_FILE),
     ("channel_snapshots", SNAPSHOTS_FILE),
+    ("subscription_candidates", SUBSCRIPTION_FILE),
 ]
 
 

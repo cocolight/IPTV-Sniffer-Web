@@ -602,7 +602,10 @@ class OperatorChannelStore:
                     "channel_num": ch.get("num"),
                     "is_hd": ch.get("is_hd", False),
                     "time_shift": ch.get("time_shift", False),
-                    "time_shift_days": ch.get("time_shift_days"),
+                    # TimeShiftLength is measured in minutes.  Older backups
+                    # used the misleading time_shift_days name; accept it on
+                    # import but write the canonical field from now on.
+                    "time_shift_minutes": ch.get("time_shift_minutes", ch.get("time_shift_days")),
                     "category": str(ch.get("category") or classify_channel_name(name)).strip(),
                     "operator_group": str(ch.get("operator_group", "")).strip(),
                     "fcc_ip": str(ch.get("fcc_ip", "")).strip(),

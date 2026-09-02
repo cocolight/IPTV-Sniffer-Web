@@ -963,6 +963,7 @@ const BACKUP_MODULES = [
   ["stb_token", "机顶盒认证信息"],
   ["iptv_auth_backups", "IPTV 认证备份"],
   ["channel_snapshots", "频道列表快照"],
+  ["subscription_candidates", "订阅候选清单"],
 ];
 let pendingGlobalBackup = null;
 let pendingAuthBackupConflicts = [];

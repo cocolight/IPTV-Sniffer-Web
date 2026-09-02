@@ -21,7 +21,7 @@ def test_epg_refresh_rebuilds_missing_operator_channel_mapping():
     assert (updated, rebuilt, total) == (0, 1, 1)
     channel = channels["239.1.2.3:5000"]
     assert channel["time_shift"] is True
-    assert channel["time_shift_days"] == 10080
+    assert channel["time_shift_minutes"] == 10080
     assert channel["channel_id"] == "1001"
     assert channel["source"] == "epg_refresh_rebuild"
     assert channel["backtv_url"].startswith("rtsp://10.0.0.5/")

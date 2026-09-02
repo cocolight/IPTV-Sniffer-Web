@@ -309,7 +309,7 @@ class ExportService:
             ch_info = op_ch.get(channel.key) or {}
             if ch_info.get("time_shift"):
                 # TimeShiftLength from operator is in minutes; always convert to days
-                raw_shift = ch_info.get("time_shift_days") or 0
+                raw_shift = ch_info.get("time_shift_minutes", ch_info.get("time_shift_days", 0)) or 0
                 eff_days = max(1, raw_shift // 1440) if raw_shift else catchup_days
                 catchup_source_attr = ""
                 if catchup_template:
@@ -510,7 +510,7 @@ class ExportService:
             ch_info = op_chs.get(f"{ch.host}:{ch.port}") or {}
             backtv = str(ch_info.get("backtv_url", "") or "").strip()
             if catchup_enabled and catchup_days > 0 and backtv:
-                raw_shift = ch_info.get("time_shift_days") or 0
+                raw_shift = ch_info.get("time_shift_minutes", ch_info.get("time_shift_days", 0)) or 0
                 eff_days = max(1, raw_shift // 1440) if raw_shift else catchup_days
                 catchup_src = (
                     f"{base_url}/hls/{hls_key}/catchup"
