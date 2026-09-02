@@ -20,6 +20,9 @@ const state = {
   logPoller: null,
   channelList: [],
   selectedChannelKeys: new Set(),
+  channelCategory: "",
+  channelSubscription: "",
+  channelCapabilities: new Set(),
   channelListSection: "subscription",
   subscription: null,
   ignoredKeys: _loadIgnoredKeys(),
@@ -428,7 +431,8 @@ async function loadChannelList() {
   try {
     const data = await requestJson("/api/channels");
     state.channelList = data.channels || [];
-    updateChannelCategoryFilter(data.categories || []);
+    renderChannelCategoryTabs(data.categories || []);
+    renderChannelFilterTabs();
     syncSelectedChannelKeys();
     filterAndRenderChannelList();
   } catch (err) { console.warn("loadChannelList:", err.message); }
@@ -446,26 +450,10 @@ function renderSubscription(data) {
   const total = Number(data.total_candidates || 0);
   const badge = $("subscriptionCandidateBadge");
   badge.className = total ? "chip ok" : "chip warning";
-  badge.textContent = `${total} 个候选频道`;
+  badge.textContent = `${total} 个已订阅`;
   $("subscriptionSummary").textContent = total
     ? `当前订阅包含 ${total} 个频道，其中回看 ${data.catchup_candidates || 0} 个、FCC ${data.fcc_candidates || 0} 个。主订阅使用固定频道 ID，不暴露运营商 RTSP 或组播源地址。`
-    : "候选清单为空。请到「频道库」勾选频道后加入订阅候选。";
-  const list = $("subscriptionCandidateList");
-  const candidates = data.candidates || [];
-  if (!candidates.length) {
-    list.innerHTML = '<div class="sources-empty-inline">暂无候选频道。到「频道库」筛选、勾选后加入即可。</div>';
-    return;
-  }
-  list.innerHTML = candidates.map((channel) => `
-    <div class="epg-source-row">
-      <span class="epg-source-name">${escapeHtml(channel.name || channel.stable_id)}</span>
-      <span class="muted small">${escapeHtml(channel.category || "其它频道")} · ${channel.has_catchup ? "回看" : "仅直播"}${channel.has_fcc ? " · FCC" : ""}</span>
-      <span class="mono small">${escapeHtml(channel.stable_id)}</span>
-      <button class="secondary xs-btn subscription-remove-btn" data-stable-id="${escapeHtml(channel.stable_id)}" type="button">移除</button>
-    </div>`).join("");
-  list.querySelectorAll(".subscription-remove-btn").forEach((btn) => {
-    btn.addEventListener("click", () => updateSubscriptionCandidates("remove", [btn.dataset.stableId]));
-  });
+    : "当前没有已订阅频道。请到「频道库」勾选频道后加入订阅。";
 }
 
 async function loadSubscription() {
@@ -490,17 +478,71 @@ async function updateSubscriptionCandidates(action, stableIds = []) {
   } catch (err) { alert(err.message); }
 }
 
-function updateChannelCategoryFilter(categories) {
-  const select = $("clFilterCategory");
-  if (!select) return;
-  const current = select.value;
-  const known = categories.length
-    ? categories
-    : ["央视频道", "卫视频道", "其它频道"];
-  select.innerHTML = `<option value="">全部分类</option>` + known.map((cat) =>
-    `<option value="${escapeHtml(cat)}">${escapeHtml(cat)}</option>`
-  ).join("");
-  if (known.includes(current)) select.value = current;
+function renderChannelCategoryTabs(categories) {
+  const tabs = $("clCategoryTabs");
+  if (!tabs) return;
+  const known = categories.length ? categories : ["央视频道", "卫视频道", "其它频道"];
+  const current = state.channelCategory;
+  const counts = new Map();
+  (state.channelList || []).forEach((channel) => {
+    const category = channel.category || "其它频道";
+    counts.set(category, (counts.get(category) || 0) + 1);
+  });
+  const items = [["", "全部频道", (state.channelList || []).length], ...known.map((category) => [category, category, counts.get(category) || 0])];
+  tabs.innerHTML = items.map(([value, label, count]) => `
+    <button class="category-tab ${value === current ? "active" : ""}" type="button" data-category="${escapeHtml(value)}">
+      ${escapeHtml(label)} <span>${count}</span>
+    </button>`).join("");
+  tabs.querySelectorAll(".category-tab").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.channelCategory = button.dataset.category || "";
+      renderChannelCategoryTabs(known);
+      filterAndRenderChannelList();
+    });
+  });
+}
+
+function channelQuality(channel) {
+  const text = [channel.name, channel.resolution_label, channel.quality_group].join(" ").toUpperCase();
+  const width = Number(channel.width || 0);
+  const height = Number(channel.height || 0);
+  if (width >= 3840 || height >= 2160 || /(?:4K|UHD|2160)/.test(text)) return "4K";
+  if (channel.is_hd || width >= 1280 || height >= 720 || /(?:HD|720|1080)/.test(text)) return "HD";
+  return "";
+}
+
+function hasCapability(channel, capability) {
+  if (capability === "fcc") return Boolean(channel.has_fcc);
+  if (capability === "catchup") return Boolean(channel.has_catchup);
+  if (capability === "timeshift") return Boolean(channel.has_timeshift);
+  return channelQuality(channel) === "4K";
+}
+
+function renderChannelFilterTabs() {
+  const subscriptionTabs = $("clSubscriptionTabs");
+  const capabilityTabs = $("clCapabilityTabs");
+  const channels = state.channelList || [];
+  const subscribed = channels.filter((channel) => channel.subscription_candidate).length;
+  const subscriptionItems = [["", "全部", channels.length], ["subscribed", "已订阅", subscribed], ["unsubscribed", "未订阅", channels.length - subscribed]];
+  subscriptionTabs.innerHTML = subscriptionItems.map(([value, label, count]) => `
+    <button class="category-tab ${value === state.channelSubscription ? "active" : ""}" type="button" data-subscription="${value}">${label} <span>${count}</span></button>`).join("");
+  subscriptionTabs.querySelectorAll(".category-tab").forEach((button) => button.addEventListener("click", () => {
+    state.channelSubscription = button.dataset.subscription || "";
+    renderChannelFilterTabs();
+    filterAndRenderChannelList();
+  }));
+  const capabilityItems = [["fcc", "FCC"], ["catchup", "回看"], ["timeshift", "时移"], ["4k", "4K"]];
+  capabilityTabs.innerHTML = capabilityItems.map(([key, label]) => {
+    const count = channels.filter((channel) => hasCapability(channel, key)).length;
+    return `<button class="category-tab ${state.channelCapabilities.has(key) ? "active" : ""}" type="button" data-capability="${key}">${label} <span>${count}</span></button>`;
+  }).join("");
+  capabilityTabs.querySelectorAll(".category-tab").forEach((button) => button.addEventListener("click", () => {
+    const key = button.dataset.capability || "";
+    if (state.channelCapabilities.has(key)) state.channelCapabilities.delete(key);
+    else state.channelCapabilities.add(key);
+    renderChannelFilterTabs();
+    filterAndRenderChannelList();
+  }));
 }
 
 function syncSelectedChannelKeys() {
@@ -516,12 +558,6 @@ function setChannelSelected(key, selected) {
 
 function visibleFlatKeys() {
   return [...document.querySelectorAll("#clChannelTableBody tr[data-key]")]
-    .map((row) => row.dataset.key)
-    .filter(Boolean);
-}
-
-function visibleGroupKeys() {
-  return [...document.querySelectorAll("#clGroupTableBody tr[data-key]")]
     .map((row) => row.dataset.key)
     .filter(Boolean);
 }
@@ -543,27 +579,31 @@ function refreshChannelSelectionControls() {
   const flatAll = flatKeys.length > 0 && flatKeys.every((key) => state.selectedChannelKeys.has(key));
   const flatSelect = $("clSelectAll");
   if (flatSelect) flatSelect.checked = flatAll;
-  const groupKeys = visibleGroupKeys();
-  const groupAll = groupKeys.length > 0 && groupKeys.every((key) => state.selectedChannelKeys.has(key));
-  const groupSelect = $("clGroupSelectAll");
-  if (groupSelect) groupSelect.checked = groupAll;
+  const selectedCount = state.selectedChannelKeys.size;
+  const selectionBar = $("clSelectionBar");
+  if (selectionBar) selectionBar.hidden = selectedCount === 0;
+  const selectionCount = $("clSelectionCount");
+  if (selectionCount) selectionCount.textContent = `已选择 ${selectedCount} 个频道`;
 }
 
 function filterAndRenderChannelList() {
-  if (_groupViewActive) { filterAndRenderGroupView(); return; }
   const name = ($("clFilterName").value || "").trim().toLowerCase();
-  const category = $("clFilterCategory").value;
+  const category = state.channelCategory;
+  const subscription = state.channelSubscription;
   let filtered = state.channelList || [];
-  if (name) filtered = filtered.filter(ch => (ch.name || "").toLowerCase().includes(name));
+  if (name) filtered = filtered.filter(ch => [ch.name, ch.key, ch.tvg_id, ch.tvg_name].some((value) => String(value || "").toLowerCase().includes(name)));
   if (category) filtered = filtered.filter(ch => ch.category === category);
+  if (subscription) filtered = filtered.filter(ch => subscription === "subscribed" ? ch.subscription_candidate : !ch.subscription_candidate);
+  if (state.channelCapabilities.size) filtered = filtered.filter((channel) => [...state.channelCapabilities].every((capability) => hasCapability(channel, capability)));
   renderChannelList(_sortChannels(filtered));
 }
 
 function renderChannelList(channels) {
   const total = (state.channelList || []).length;
+  const subscribed = (state.channelList || []).filter((channel) => channel.subscription_candidate).length;
   $("clChannelCount").textContent = channels.length === total
-    ? `${channels.length} 个`
-    : `${channels.length} / ${total} 个`;
+    ? `共 ${total} 个 · 已订阅 ${subscribed}`
+    : `显示 ${channels.length} / ${total} · 已订阅 ${subscribed}`;
   const tbody = $("clChannelTableBody");
   if (!channels.length) {
     tbody.innerHTML = '<tr><td colspan="8" class="empty">频道列表为空，请先完成运营商频道发现并导入。</td></tr>';
@@ -574,15 +614,21 @@ function renderChannelList(channels) {
     const addr = ch.key || `${ch.host || ""}:${ch.port ?? ""}`;
     const epg = ch.tvg_id || "-";
     const checked = state.selectedChannelKeys.has(ch.key) ? "checked" : "";
+    const quality = channelQuality(ch);
+    const capabilities = [
+      ch.has_fcc ? '<span class="capability-badge">FCC</span>' : "",
+      ch.has_catchup ? '<span class="capability-badge">回看</span>' : "",
+      ch.has_timeshift ? '<span class="capability-badge">时移</span>' : "",
+    ].filter(Boolean).join("") || '<span class="muted small">—</span>';
     return `
     <tr data-key="${escapeHtml(ch.key || "")}">
       <td><input type="checkbox" class="cl-check" data-key="${escapeHtml(ch.key || "")}" ${checked}></td>
-      <td>${escapeHtml(ch.name || "")}</td>
+      <td><div class="channel-title">${escapeHtml(ch.name || "")}</div><div class="line-sub">${escapeHtml(ch.category || "其它频道")}</div></td>
       <td class="mono small">${escapeHtml(addr)}</td>
-      <td>${escapeHtml(ch.category || "")}</td>
       <td class="mono small">${escapeHtml(epg)}</td>
-      <td>${ch.subscription_candidate ? '<span class="badge hd">已加入</span>' : '<span class="muted small">未加入</span>'}</td>
-      <td>${ch.is_hd ? '<span class="badge hd">高清</span>' : '<span class="muted small">—</span>'}</td>
+      <td>${quality ? `<span class="quality-badge ${quality === "4K" ? "uhd" : ""}">${quality}</span>` : '<span class="muted small">—</span>'}</td>
+      <td><div class="capability-list">${capabilities}</div></td>
+      <td>${ch.subscription_candidate ? '<span class="badge hd">已订阅</span>' : '<span class="muted small">未订阅</span>'}</td>
       <td><button class="secondary xs-btn channel-edit-btn" type="button" data-key="${escapeHtml(ch.key || "")}">编辑</button></td>
     </tr>`;
   }).join("");
@@ -882,18 +928,8 @@ $("clSelectAll").addEventListener("change", function() {
   visibleFlatKeys().forEach((key) => setChannelSelected(key, this.checked));
   refreshChannelSelectionControls();
 });
-$("clGroupSelectAll").addEventListener("change", function() {
-  visibleGroupKeys().forEach((key) => setChannelSelected(key, this.checked));
-  refreshChannelSelectionControls();
-});
-$("clSelectAllBtn").addEventListener("click", () => {
-  const keys = _groupViewActive ? visibleGroupKeys() : visibleFlatKeys();
-  keys.forEach((key) => setChannelSelected(key, true));
-  refreshChannelSelectionControls();
-});
 $("clClearSelBtn").addEventListener("click", () => {
-  const keys = _groupViewActive ? visibleGroupKeys() : visibleFlatKeys();
-  keys.forEach((key) => setChannelSelected(key, false));
+  state.selectedChannelKeys.clear();
   refreshChannelSelectionControls();
 });
 $("clAddSelectedCandidateBtn").addEventListener("click", async () => {
@@ -924,7 +960,6 @@ $("clDeleteSelectedBtn").addEventListener("click", async () => {
 });
 $("clRefreshBtn").addEventListener("click", () => loadChannelList());
 $("clFilterName").addEventListener("input", filterAndRenderChannelList);
-$("clFilterCategory").addEventListener("change", filterAndRenderChannelList);
 document.querySelectorAll(".copy-subscription-btn").forEach((btn) => btn.addEventListener("click", async () => {
   const key = btn.dataset.subscriptionUrl;
   const value = $(key === "best" ? "subscriptionBestUrl" : key === "all" ? "subscriptionAllUrl" : key === "hls" ? "subscriptionHlsUrl" : "subscriptionEpgUrl").value;
@@ -945,7 +980,7 @@ $("subscriptionDownloadBtn").addEventListener("click", () => {
   document.body.removeChild(a);
 });
 $("subscriptionResetBestBtn").addEventListener("click", async () => {
-  if (!confirm("将候选清单恢复为当前频道库的最佳频道。是否继续？")) return;
+  if (!confirm("将订阅恢复为当前频道库的最佳频道。是否继续？")) return;
   await updateSubscriptionCandidates("reset_to_best");
 });
 $("backupExportBtn").addEventListener("click", () => showBackupExportDialog());
@@ -963,7 +998,7 @@ const BACKUP_MODULES = [
   ["stb_token", "机顶盒认证信息"],
   ["iptv_auth_backups", "IPTV 认证备份"],
   ["channel_snapshots", "频道列表快照"],
-  ["subscription_candidates", "订阅候选清单"],
+  ["subscription_candidates", "订阅频道清单"],
 ];
 let pendingGlobalBackup = null;
 let pendingAuthBackupConflicts = [];
@@ -1327,7 +1362,7 @@ function renderStbDiscoveryChannels(channels) {
       <td>${escapeHtml(ch.name || "")}</td>
       <td>${escapeHtml(ch.category || ch.operator_group || "")}</td>
       <td class="mono">${escapeHtml(ch.ip || "")}:${escapeHtml(String(ch.port || ""))}</td>
-      <td>${ch.is_hd ? "✓" : ""}</td>
+      <td>${channelQuality(ch) || "—"}</td>
       <td>${ch.time_shift ? "✓" : ""}</td>
     </tr>`).join("");
 }
@@ -1881,189 +1916,4 @@ document.querySelectorAll(".cl-table th.sortable").forEach(th => {
     _updateSortHeaders();
     filterAndRenderChannelList();
   });
-});
-
-// ── Channel group view ────────────────────────────────────────────────────
-
-let _groupViewActive = false;
-
-function _roleBadge(role, manual = false) {
-  if (role === "primary") {
-    return `<span class="source-role ${manual ? "manual" : "primary"}">${manual ? "手动主源" : "自动主源"}</span>`;
-  }
-  return '<span class="source-role alt">备选线路</span>';
-}
-
-function _lineTech(ch) {
-  const codec = ch.codec_name || "编码未知";
-  const fps = ch.frame_rate ? `${ch.frame_rate}fps` : "";
-  const packets = Number(ch.packets || 0) > 0 ? `${ch.packets} 包` : "";
-  return [codec, fps, packets].filter(Boolean);
-}
-
-function _lineFcc(ch) {
-  const parts = [];
-  if (ch.fcc_ip && ch.fcc_port) parts.push(`FCC ${ch.fcc_ip}:${ch.fcc_port}`);
-  if (ch.fec_port) parts.push(`FEC ${ch.fec_port}`);
-  return parts.length ? parts : ["无 FCC/FEC"];
-}
-
-function _lineStatus(ch) {
-  const status = ch.export_health_status || "";
-  const label = status === "ok" ? "播放可用"
-    : status === "failed" ? "播放失败"
-    : status === "timeout" ? "播放超时"
-    : status === "error" ? "检查异常"
-    : "未检查";
-  const when = ch.export_health_checked_at || ch.updated_at || ch.last_seen || ch.epg_matched_at;
-  const detail = ch.export_health_message || "";
-  return {label, detail, when: formatDateTime(when)};
-}
-
-function renderChannelGroups(groups) {
-  const tbody = $("clGroupTableBody");
-  if (!groups.length) {
-    tbody.innerHTML = '<tr><td colspan="8" class="empty">暂无频道组，请先导入频道。</td></tr>';
-    refreshChannelSelectionControls();
-    return;
-  }
-  const rows = [];
-  for (const g of groups) {
-    const p = g.primary;
-    const hasAlts = g.alternates.length > 0;
-    const pStatus = _lineStatus(p);
-    const pChecked = state.selectedChannelKeys.has(p.key) ? "checked" : "";
-    rows.push(`<tr data-group="${escapeHtml(g.group_key)}" data-key="${escapeHtml(p.key || "")}">
-      <td><input type="checkbox" class="cl-check" data-key="${escapeHtml(p.key || "")}" ${pChecked}></td>
-      <td><button class="expand-btn" data-group="${escapeHtml(g.group_key)}" aria-expanded="false">${hasAlts ? "▶" : ""}</button></td>
-      <td>
-        <div class="line-stack">
-          <span class="line-title">${escapeHtml(p.name || "")}</span>
-          <span class="line-sub mono">${escapeHtml(p.key || "")}</span>
-          <span class="line-sub">${g.count} 条线路，${g.alternates.length} 条备选</span>
-        </div>
-      </td>
-      <td>${_roleBadge("primary", Boolean(p.is_primary))}</td>
-      <td>
-        <div class="line-meta">${_lineTech(p).map(x => `<span>${escapeHtml(x)}</span>`).join("")}</div>
-        <div class="line-sub">${_lineFcc(p).map(escapeHtml).join(" · ")}</div>
-      </td>
-      <td class="line-status">
-        <strong>${escapeHtml(pStatus.label)}</strong>
-        ${pStatus.detail ? `<div class="line-sub">${escapeHtml(pStatus.detail)}</div>` : ""}
-        <div class="line-sub">${escapeHtml(pStatus.when)}</div>
-      </td>
-      <td class="mono small">${escapeHtml(p.tvg_id || p.tvg_name || "—")}</td>
-      <td><button class="secondary xs-btn diag-ch-btn" data-key="${escapeHtml(p.key||"")}">诊断</button></td>
-    </tr>`);
-    for (const alt of g.alternates) {
-      const altStatus = _lineStatus(alt);
-      const altChecked = state.selectedChannelKeys.has(alt.key) ? "checked" : "";
-      rows.push(`<tr class="alt-row hidden" data-parent="${escapeHtml(g.group_key)}" data-key="${escapeHtml(alt.key || "")}">
-        <td><input type="checkbox" class="cl-check" data-key="${escapeHtml(alt.key || "")}" ${altChecked}></td>
-        <td></td>
-        <td>
-          <div class="line-stack">
-            <span class="line-title">${escapeHtml(alt.name || "")}</span>
-            <span class="line-sub mono">${escapeHtml(alt.key || "")}</span>
-          </div>
-        </td>
-        <td>${_roleBadge("alt")}</td>
-        <td>
-          <div class="line-meta">${_lineTech(alt).map(x => `<span>${escapeHtml(x)}</span>`).join("")}</div>
-          <div class="line-sub">${_lineFcc(alt).map(escapeHtml).join(" · ")}</div>
-        </td>
-        <td class="line-status">
-          <strong>${escapeHtml(altStatus.label)}</strong>
-          ${altStatus.detail ? `<div class="line-sub">${escapeHtml(altStatus.detail)}</div>` : ""}
-          <div class="line-sub">${escapeHtml(altStatus.when)}</div>
-        </td>
-        <td class="mono small">${escapeHtml(alt.tvg_id || alt.tvg_name || "—")}</td>
-        <td><button class="secondary xs-btn set-primary-btn"
-            data-group="${escapeHtml(g.group_key)}"
-            data-key="${escapeHtml(alt.key||"")}">设为主源</button></td>
-      </tr>`);
-    }
-  }
-  tbody.innerHTML = rows.join("");
-  tbody.querySelectorAll(".cl-check").forEach((cb) => {
-    cb.addEventListener("change", () => {
-      setChannelSelected(cb.dataset.key, cb.checked);
-      refreshChannelSelectionControls();
-    });
-  });
-  refreshChannelSelectionControls();
-
-  // expand/collapse
-  tbody.querySelectorAll(".expand-btn").forEach(btn => {
-    btn.addEventListener("click", () => {
-      const gk = btn.dataset.group;
-      const expanded = btn.getAttribute("aria-expanded") === "true";
-      btn.setAttribute("aria-expanded", String(!expanded));
-      btn.textContent = expanded ? "▶" : "▼";
-      tbody.querySelectorAll(`tr[data-parent="${CSS.escape(gk)}"]`).forEach(tr => {
-        tr.classList.toggle("hidden", expanded);
-      });
-    });
-  });
-
-  // set-primary
-  tbody.querySelectorAll(".set-primary-btn").forEach(btn => {
-    btn.addEventListener("click", async () => {
-      try {
-        await requestJson("/api/channels/set-primary", {
-          method: "POST",
-          body: JSON.stringify({group_key: btn.dataset.group, channel_key: btn.dataset.key}),
-        });
-        await loadChannelGroups();
-      } catch (err) { alert(err.message); }
-    });
-  });
-
-  tbody.querySelectorAll(".diag-ch-btn").forEach(btn => {
-    btn.addEventListener("click", () => {
-      $("diagChannel").value = btn.dataset.key || "";
-      showTab("diagnose");
-    });
-  });
-}
-
-async function loadChannelGroups() {
-  try {
-    const d = await requestJson("/api/channels/groups");
-    state.channelGroups = d.groups || [];
-    filterAndRenderGroupView();
-  } catch (err) {
-    $("clGroupTableBody").innerHTML = `<tr><td colspan="8" class="empty">加载失败：${escapeHtml(err.message)}</td></tr>`;
-    refreshChannelSelectionControls();
-  }
-}
-
-function filterAndRenderGroupView() {
-  const groups = state.channelGroups || [];
-  const name = ($("clFilterName").value || "").trim().toLowerCase();
-  const category = $("clFilterCategory").value;
-  let filtered = groups;
-  if (name) filtered = filtered.filter(g =>
-    (g.primary.name || "").toLowerCase().includes(name) ||
-    g.alternates.some(a => (a.name || "").toLowerCase().includes(name))
-  );
-  if (category) filtered = filtered.filter(g => g.primary.category === category);
-  renderChannelGroups(filtered);
-  const total = (state.channelList || []).length;
-  $("clChannelCount").textContent = filtered.length === groups.length
-    ? `${groups.length} 组 / ${total} 条`
-    : `${filtered.length} / ${groups.length} 组 · ${total} 条`;
-}
-
-let _groupViewInit = false;
-$("clGroupViewBtn").addEventListener("click", () => {
-  _groupViewActive = !_groupViewActive;
-  $("clGroupViewBtn").textContent = _groupViewActive ? "平铺视图" : "分组视图";
-  $("clFlatView").hidden = _groupViewActive;
-  $("clGroupView").hidden = !_groupViewActive;
-  if (_groupViewActive) loadChannelGroups();
-  else {
-    filterAndRenderChannelList();
-  }
 });

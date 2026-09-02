@@ -1286,7 +1286,9 @@ def api_channels():
         stable_id = stable_by_key.get(str(row.get("key") or "")) or _stable_channel_id(row)
         row["stable_id"] = stable_id
         row["subscription_candidate"] = stable_id in candidate_ids
-        row["has_catchup"] = bool(catalog.get(stable_id, {}).get("operator", {}).get("backtv_url"))
+        operator = catalog.get(stable_id, {}).get("operator", {})
+        row["has_catchup"] = bool(operator.get("backtv_url"))
+        row["has_timeshift"] = bool(operator.get("time_shift") or _operator_time_shift_minutes(operator))
         row["has_fcc"] = bool(str(row.get("fcc_ip") or "").strip() and row.get("fcc_port"))
     seen = {cat: None for cat in CATEGORY_OPTIONS}
     for row in rows:

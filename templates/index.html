@@ -87,7 +87,7 @@
           </article>
           <article>
             <strong>3. 订阅中心</strong>
-            <span>从频道库选定要看的频道，加入候选清单。播放器使用固定的动态订阅地址；频道源、FCC 或回看地址刷新后，无需重新导入订阅。</span>
+            <span>从频道库选定要看的频道，加入订阅。播放器使用固定的动态订阅地址；频道源、FCC 或回看地址刷新后，无需重新导入订阅。</span>
           </article>
           <article>
             <strong>4. 播放诊断</strong>
@@ -185,7 +185,7 @@
                     <th>频道名称</th>
                     <th>分类</th>
                     <th>组播地址</th>
-                    <th class="w-50">高清</th>
+                    <th class="w-50">画质</th>
                     <th class="w-50">回看</th>
                   </tr>
                 </thead>
@@ -329,7 +329,7 @@
               <h2>订阅中心</h2>
               <span id="subscriptionCandidateBadge" class="chip neutral">加载中</span>
             </div>
-            <p class="muted small">把频道库中的频道加入候选清单。以下地址固定不变；运营商频道表、FCC 或回看地址刷新后，播放器下次请求会自动使用最新来源。兼容别名与主订阅内容相同。</p>
+            <p class="muted small">在频道库中管理已订阅频道。以下地址固定不变；运营商频道表、FCC 或回看地址刷新后，播放器下次请求会自动使用最新来源。兼容别名与主订阅内容相同。</p>
             <div class="form-grid compact-grid">
               <label>
                 主订阅（推荐）
@@ -348,17 +348,12 @@
                 <div class="copy-field"><input id="subscriptionEpgUrl" class="mono" type="text" readonly><button class="secondary copy-subscription-btn" data-subscription-url="epg" type="button">复制</button></div>
               </label>
             </div>
-            <div id="subscriptionSummary" class="result-box muted compact-result">正在读取候选频道…</div>
+            <div id="subscriptionSummary" class="result-box muted compact-result">正在读取订阅频道…</div>
             <div class="button-row mt-8">
               <button id="subscriptionPreviewBtn" class="primary" type="button">预览主订阅</button>
               <button id="subscriptionDownloadBtn" class="secondary" type="button">下载当前静态副本</button>
               <button id="subscriptionResetBestBtn" class="secondary" type="button">恢复当前最佳频道</button>
             </div>
-            <div class="section-title mt-16">
-              <h2>候选频道</h2>
-              <span class="muted small">移除后会立即从动态订阅中消失；不会删除频道库记录。</span>
-            </div>
-            <div id="subscriptionCandidateList" class="snapshot-list"><div class="sources-empty-inline">加载中…</div></div>
           </section>
 
           <section class="card cl-section" data-cl-panel="export" hidden>
@@ -405,7 +400,7 @@
             <div id="epgStatusBox" class="result-box muted compact-result"></div>
             <div class="section-title mt-16">
               <h2>导出结果</h2>
-              <span class="muted">静态文件默认按订阅候选清单导出；临时勾选频道库中的条目时，只导出所勾选源。</span>
+              <span class="muted">静态文件默认按已订阅频道导出；临时勾选频道库中的条目时，只导出所勾选源。</span>
             </div>
             <div class="section-subtitle">
               <h3>rtp2httpd 配置</h3>
@@ -442,7 +437,7 @@
             </div>
             <div class="section-subtitle">
               <h3>回看 / 时移</h3>
-              <span class="chip warning">暂不可用</span>
+              <span class="chip ok">已启用</span>
               <span class="muted small">直播源与回看源分开处理：直播走 rtp2httpd/HLS，回看走运营商 RTSP backtv_url</span>
             </div>
             <div class="form-grid" style="margin-bottom:4px">
@@ -597,25 +592,32 @@
           <section class="card cl-section" data-cl-panel="list">
             <div class="section-title">
               <h2>频道库</h2>
-              <span id="clChannelCount" class="chip neutral">0 个</span>
+              <span id="clChannelCount" class="chip neutral">加载中</span>
             </div>
-            <div class="toolbar">
-              <button id="clSelectAllBtn" class="secondary" type="button">全选</button>
-              <button id="clClearSelBtn" class="secondary" type="button">取消全选</button>
-              <button id="clAddSelectedCandidateBtn" class="primary" type="button">加入订阅候选</button>
-              <button id="clRemoveSelectedCandidateBtn" class="secondary" type="button">从候选移除</button>
-              <button id="clDeleteSelectedBtn" class="danger" type="button">删除选中</button>
-              <button id="clRefreshBtn" class="secondary" type="button">刷新</button>
-              <button id="clGroupViewBtn" class="secondary" type="button">分组视图</button>
+            <div class="library-controls">
+              <div class="cl-filter">
+                <input id="clFilterName" class="cl-filter-name" type="search" placeholder="搜索频道名称、IP 或 EPG…" autocomplete="off">
+              </div>
+              <div class="library-view-actions" aria-label="频道库视图">
+                <button id="clRefreshBtn" class="secondary" type="button">刷新</button>
+              </div>
             </div>
-            <div class="cl-filter">
-              <input id="clFilterName" class="cl-filter-name" type="search" placeholder="搜索频道名称…" autocomplete="off">
-              <select id="clFilterCategory">
-                <option value="">全部分类</option>
-                <option value="央视频道">央视频道</option>
-                <option value="卫视频道">卫视频道</option>
-                <option value="其它频道">其它频道</option>
-              </select>
+            <div id="clCategoryTabs" class="category-tabs" role="tablist" aria-label="频道分类"></div>
+            <div class="library-filter-row">
+              <div class="filter-tabs-wrap"><span class="filter-label">订阅</span><div id="clSubscriptionTabs" class="category-tabs compact-tabs" role="tablist" aria-label="订阅状态"></div></div>
+              <div class="filter-tabs-wrap"><span class="filter-label">能力</span><div id="clCapabilityTabs" class="category-tabs compact-tabs" role="group" aria-label="频道能力"></div></div>
+            </div>
+            <div id="clSelectionBar" class="selection-bar" hidden>
+              <strong id="clSelectionCount">已选择 0 个频道</strong>
+              <div class="button-row">
+                <button id="clAddSelectedCandidateBtn" class="primary" type="button">加入订阅</button>
+                <button id="clRemoveSelectedCandidateBtn" class="secondary" type="button">移出订阅</button>
+                <button id="clClearSelBtn" class="secondary" type="button">取消选择</button>
+                <details class="bulk-more">
+                  <summary>更多</summary>
+                  <button id="clDeleteSelectedBtn" class="danger" type="button">删除频道</button>
+                </details>
+              </div>
             </div>
             <!-- flat view -->
             <div id="clFlatView" class="table-wrap mt-8 sticky-table">
@@ -625,35 +627,15 @@
                     <th><input type="checkbox" id="clSelectAll"></th>
                     <th class="sortable" data-sort="name">频道名称</th>
                     <th class="sortable" data-sort="addr">组播地址</th>
-                    <th class="sortable" data-sort="category">分类</th>
                     <th class="sortable" data-sort="epg">EPG 标识</th>
+                    <th>画质</th>
+                    <th>能力</th>
                     <th>订阅</th>
-                    <th>高清</th>
                     <th>操作</th>
                   </tr>
                 </thead>
                 <tbody id="clChannelTableBody">
                   <tr><td colspan="8" class="empty">频道列表为空，请先完成运营商频道发现并导入。</td></tr>
-                </tbody>
-              </table>
-            </div>
-            <!-- group view -->
-            <div id="clGroupView" class="table-wrap mt-8 sticky-table" hidden>
-              <table class="cl-table group-table">
-                <thead>
-                  <tr>
-                    <th class="w-28"><input type="checkbox" id="clGroupSelectAll"></th>
-                    <th class="w-28"></th>
-                    <th>频道 / 来源</th>
-                    <th class="w-82">角色</th>
-                    <th>技术 / FCC</th>
-                    <th class="w-128">最近状态</th>
-                    <th class="w-120">EPG</th>
-                    <th class="w-94">操作</th>
-                  </tr>
-                </thead>
-                <tbody id="clGroupTableBody">
-                  <tr><td colspan="8" class="empty">加载中…</td></tr>
                 </tbody>
               </table>
             </div>
@@ -741,7 +723,7 @@
         </label>
         <label class="checkbox-label align-self-center">
           <input id="channelEditHd" type="checkbox">
-          标记为高清频道
+          标记为 HD 频道
         </label>
       </div>
       <div class="dialog-actions">

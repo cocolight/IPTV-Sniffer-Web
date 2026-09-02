@@ -64,9 +64,32 @@ body {
 .line-meta { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; min-width: 0; }
 .line-meta span { white-space: nowrap; }
 .line-status { line-height: 1.45; }
-.cl-filter { display: flex; gap: 8px; align-items: center; margin: 10px 0 4px; flex-wrap: wrap; }
+.library-controls { display: flex; gap: 10px; align-items: center; justify-content: space-between; margin: 10px 0 4px; flex-wrap: wrap; }
+.cl-filter { display: flex; gap: 8px; align-items: center; flex: 1 1 520px; flex-wrap: wrap; }
 .cl-filter-name { flex: 1; min-width: 160px; }
 .cl-filter select { min-width: 110px; }
+.library-view-actions { display: flex; align-items: center; gap: 8px; }
+.library-view-actions .active { color: #1749cc; border-color: #b9cbff; background: #edf3ff; }
+.category-tabs { display: flex; gap: 6px; flex-wrap: wrap; margin: 8px 0 4px; }
+.category-tab { min-height: 30px; padding: 0 9px; border: 1px solid var(--line); border-radius: 999px; background: #fff; color: var(--muted); cursor: pointer; font-size: 12px; font-weight: 650; }
+.category-tab span { margin-left: 3px; color: inherit; opacity: .78; font-variant-numeric: tabular-nums; }
+.category-tab:hover { border-color: #b9cbff; color: #1749cc; }
+.category-tab.active { border-color: #b9cbff; background: #edf3ff; color: #1749cc; }
+.library-filter-row { display: flex; gap: 18px; align-items: center; flex-wrap: wrap; margin: 8px 0 4px; }
+.filter-tabs-wrap { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.filter-label { color: var(--muted); font-size: 12px; font-weight: 750; }
+.compact-tabs { margin: 0; }
+.channel-title { font-weight: 700; overflow-wrap: anywhere; }
+.quality-badge, .capability-badge { display: inline-flex; min-height: 22px; padding: 0 7px; border-radius: 999px; align-items: center; font-size: 12px; font-weight: 750; }
+.quality-badge { background: #e8efff; color: #1749cc; }
+.quality-badge.uhd { background: #f3eaff; color: #6b2fb3; }
+.capability-list { display: flex; gap: 4px; flex-wrap: wrap; }
+.capability-badge { background: #edf1f5; color: #384152; }
+.selection-bar { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin: 10px 0; padding: 10px 12px; border: 1px solid #cbd8ff; border-radius: 8px; background: #f5f8ff; }
+.bulk-more { position: relative; }
+.bulk-more summary { min-height: 34px; padding: 0 12px; display: inline-flex; align-items: center; border: 1px solid var(--line); border-radius: 7px; background: #fff; cursor: pointer; font-weight: 650; }
+.bulk-more[open] > summary { border-color: var(--primary); }
+.bulk-more > button { position: absolute; right: 0; top: calc(100% + 6px); z-index: 5; min-width: 100px; white-space: nowrap; box-shadow: var(--shadow); }
 
 .layout {
   width: min(1040px, calc(100% - 32px));
@@ -607,7 +630,11 @@ body.logs-open .footer {
   .layout { width: min(100% - 16px, 960px); }
   .metrics-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   table { min-width: 760px; }
-  .cl-table { min-width: 620px; }
+  .cl-table { min-width: 840px; }
+  .library-controls { align-items: stretch; }
+  .library-view-actions { width: 100%; justify-content: flex-end; }
+  .library-filter-row { gap: 8px; }
+  .filter-tabs-wrap { width: 100%; flex-wrap: wrap; }
   .table-wrap > table:not(.cl-table):not(.diag-table) th:nth-child(2),
   .table-wrap > table:not(.cl-table):not(.diag-table) td:nth-child(2) { width: 138px; }
   .table-wrap > table:not(.cl-table):not(.diag-table) th:nth-child(5),

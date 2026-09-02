@@ -160,3 +160,6 @@ def test_channels_api_exposes_subscription_candidate_state(tmp_path, monkeypatch
     assert response.status_code == 200
     assert payload["channels"][0]["stable_id"] == "c-1001"
     assert payload["channels"][0]["subscription_candidate"] is True
+    assert payload["channels"][0]["has_fcc"] is True
+    assert payload["channels"][0]["has_catchup"] is True
+    assert payload["channels"][0]["has_timeshift"] is True
