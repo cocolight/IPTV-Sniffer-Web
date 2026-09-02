@@ -218,6 +218,11 @@ class IptvAuthService:
         has_multicast_route = any(
             str(r.get("dst") or "").startswith("224.") for r in routes
         )
+        has_private_route = any(
+            str(r.get("dst") or "") == "10.0.0.0/8"
+            and (not r.get("dev") or str(r.get("dev")) == iface)
+            for r in routes
+        )
         return {
             "created_at": time.time(),
             "interface": iface,
@@ -228,6 +233,7 @@ class IptvAuthService:
             "ipv4": ipv4,
             "routes": routes,
             "has_multicast_route": has_multicast_route,
+            "has_private_route": has_private_route,
             "link": link,
             "addr": addr,
         }
@@ -291,6 +297,11 @@ class IptvAuthService:
         route_mode = route_mode if route_mode in {"none", "multicast", "iptv_private"} else "multicast"
         return f"""#!/bin/sh
 set -eu
+# udhcpc runs hooks with a minimal PATH on FNOS.  The image-provided Python
+# lives in /usr/local/bin; without it, a successful DHCP bound event exits
+# while calculating the netmask and leaves the interface unconfigured.
+PATH="/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH
 LOG="/app/data/iptv-auth-{iface}.log"
 [ "${{interface:-}}" = "{iface}" ] || exit 1
 mask2cidr() {{
@@ -308,23 +319,45 @@ PY
 echo "$(date '+%F %T') udhcpc event=$1 iface=$interface ip=${{ip:-}} router=${{router:-}}" >> "$LOG"
 case "$1" in
   deconfig)
-    ip -4 addr flush dev "$interface" || true
+    # FNOS may issue ``deconfig`` as the first half of a normal renew/rebind,
+    # then deliver ``bound`` a few seconds later.  Flushing here creates an
+    # avoidable outage in which an in-flight EPG or RTSP request times out.
+    # ``apply()`` already flushes the interface before a *new* authentication
+    # attempt, so keep the current address during a renewal transition and
+    # replace it atomically when the next bound event arrives.
+    echo "$(date '+%F %T') udhcpc hook_stage=deconfig_preserved" >> "$LOG"
     ;;
   bound|renew)
-    prefix="$(mask2cidr "${{subnet:-255.255.255.0}}")"
+    prefix="$(mask2cidr "${{subnet:-255.255.255.0}}")" || {{
+      echo "$(date '+%F %T') udhcpc hook_stage=mask2cidr_failed" >> "$LOG"
+      exit 1
+    }}
     ip -4 addr flush dev "$interface" || true
     if [ -n "${{broadcast:-}}" ]; then
-      ip -4 addr add "$ip/$prefix" broadcast "$broadcast" dev "$interface"
+      ip -4 addr add "$ip/$prefix" broadcast "$broadcast" dev "$interface" || {{
+        echo "$(date '+%F %T') udhcpc hook_stage=addr_add_failed" >> "$LOG"
+        exit 1
+      }}
     else
-      ip -4 addr add "$ip/$prefix" dev "$interface"
+      ip -4 addr add "$ip/$prefix" dev "$interface" || {{
+        echo "$(date '+%F %T') udhcpc hook_stage=addr_add_failed" >> "$LOG"
+        exit 1
+      }}
     fi
-    ip link set "$interface" up
+    ip link set "$interface" up || {{
+      echo "$(date '+%F %T') udhcpc hook_stage=link_up_failed" >> "$LOG"
+      exit 1
+    }}
     if [ "{route_mode}" = "multicast" ] || [ "{route_mode}" = "iptv_private" ]; then
       ip -4 route replace 224.0.0.0/4 dev "$interface" || true
     fi
     if [ "{route_mode}" = "iptv_private" ] && [ -n "${{router:-}}" ]; then
-      ip -4 route replace 10.0.0.0/8 via "$router" dev "$interface" metric 50 || true
+      # IPTV DHCP may advertise an off-link gateway with a /32 or non-standard
+      # mask.  In that case iproute needs ``onlink`` or the 10/8 RTSP route is
+      # rejected and unicast playback falls back to the ordinary LAN route.
+      ip -4 route replace 10.0.0.0/8 via "$router" dev "$interface" onlink metric 50 || true
     fi
+    echo "$(date '+%F %T') udhcpc hook_stage=bound_configured" >> "$LOG"
     ;;
 esac
 exit 0
@@ -426,12 +459,45 @@ exit 0
         if p["requested_ip"]:
             dhcp_opts.extend(["-r", p["requested_ip"]])
 
-        # Phase 1: synchronous one-shot — confirms authentication succeeded.
-        run_step(["udhcpc", "-f", "-q", "-n", "-t", "4", "-T", "3"] + dhcp_opts, timeout=35)
-
-        # Phase 2: background renewal daemon — keeps the lease alive indefinitely.
-        # Without -f the process daemonizes; without -q it stays running and renews.
-        run_step(["udhcpc", "-n", "-t", "4", "-T", "3"] + dhcp_opts, timeout=5, check=False)
+        # Start one long-lived DHCP client.  The old two-phase flow first
+        # acquired a lease and then started a second client for renewal; that
+        # second client emitted ``deconfig`` and flushed the working address.
+        # Keep one foreground client in a detached session and wait only until
+        # its hook has installed an IPv4 lease.
+        dhcp_cmd = ["udhcpc", "-f", "-n", "-t", "4", "-T", "3"] + dhcp_opts
+        try:
+            dhcp_proc = subprocess.Popen(
+                dhcp_cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            raise RuntimeError(f"启动 DHCP 客户端失败：{exc}") from exc
+        steps.append({
+            "cmd": "udhcpc <已脱敏 DHCP 认证参数>",
+            "returncode": 0,
+            "stdout": "",
+            "stderr": "",
+            "pid": dhcp_proc.pid,
+        })
+        deadline = time.monotonic() + 35
+        lease_ready = False
+        while time.monotonic() < deadline:
+            snap = self.snapshot(iface)
+            if any(str(item.get("local") or "").startswith("10.") for item in (snap.get("ipv4") or [])):
+                lease_ready = True
+                break
+            if dhcp_proc.poll() is not None:
+                break
+            time.sleep(0.5)
+        if not lease_ready:
+            if dhcp_proc.poll() is None:
+                try:
+                    dhcp_proc.terminate()
+                except OSError:
+                    pass
+            raise RuntimeError("IPTV DHCP 认证未在 35 秒内取得 IPv4 租约")
 
         # Belt-and-suspenders: explicitly set multicast route after udhcpc.
         # The udhcpc hook does this too, but runs in a subprocess and may race
@@ -445,7 +511,10 @@ exit 0
                 "",
             )
             if gw:
-                run_step(["ip", "-4", "route", "replace", "10.0.0.0/8", "via", gw, "dev", iface, "metric", "50"], check=False)
+                run_step([
+                    "ip", "-4", "route", "replace", "10.0.0.0/8", "via", gw,
+                    "dev", iface, "onlink", "metric", "50",
+                ], check=False)
 
         snap = self.snapshot(iface)
         data_store = self._backup_data()

@@ -30,6 +30,7 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY app.py config.py models.py utils.py /app/
 COPY services /app/services
+COPY tools /app/tools
 COPY templates /app/templates
 COPY static /app/static
 

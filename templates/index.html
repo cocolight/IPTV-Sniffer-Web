@@ -18,7 +18,7 @@
         <button class="nav-pill active" data-page="home" type="button" title="首页 / 使用向导">首页</button>
         <button class="nav-pill" data-nav-tab="stbDiscovery" type="button" title="运营商频道发现">发现</button>
         <button class="nav-pill" data-nav-tab="iptvAuth" type="button" title="IPTV 认证助手">认证</button>
-        <button class="nav-pill" data-nav-tab="channelList" type="button" title="频道线路">线路</button>
+        <button class="nav-pill" data-nav-tab="channelList" type="button" title="订阅中心">订阅中心</button>
         <button class="nav-pill" data-nav-tab="diagnose" type="button" title="播放链路诊断">诊断</button>
         <a id="updateBadge" class="chip warning update-badge" href="#" target="_blank" rel="noreferrer" hidden></a>
         <button id="logsBtn" class="nav-pill logs-toggle" type="button" title="打开实时日志">日志</button>
@@ -47,13 +47,13 @@
         <div class="home-hero">
           <div class="home-hero-copy">
             <div class="eyebrow">推荐操作路径</div>
-            <h2>先发现频道，再按需要认证、维护线路与导出。</h2>
-            <p>系统从机顶盒开机流量中提取频道、组播参数和认证信息。完成发现后，可按实际播放需求继续认证或维护线路。</p>
+            <h2>先发现频道，再建立稳定订阅。</h2>
+            <p>系统从机顶盒开机流量中提取频道、组播参数和认证信息。完成发现后，在订阅中心选择频道，播放器始终使用固定订阅地址。</p>
           </div>
           <div class="home-hero-cta">
             <span class="home-hero-step">第 1 步</span>
             <strong>发现运营商频道</strong>
-            <span class="muted small">导入频道线路，并自动提取可用认证信息</span>
+            <span class="muted small">导入频道库，并自动提取可用认证信息</span>
             <button class="primary" data-home-tab="stbDiscovery" type="button">开始频道发现</button>
           </div>
         </div>
@@ -70,7 +70,7 @@
                 <pre>光猫 IPTV 口 → 交换机
   ├─ 机顶盒端口（被镜像源）
   └─ 宿主机端口（镜像目标）</pre>
-                <p class="muted small">✓ 抓机顶盒开机流量、频道表、FCC/FEC、Option60<br>✓ 生成频道线路和 rtp2httpd 源文件<br>✓ FNOS 容器需在「高级设置 → 功能」勾选 NET_RAW；实验性认证还需 NET_ADMIN<br>✗ 镜像口不能主动发 IGMP/FCC，因此不能代表 rtp2httpd 可直接播放</p>
+                <p class="muted small">✓ 抓机顶盒开机流量、频道表、FCC/FEC、Option60<br>✓ 生成订阅清单和 rtp2httpd 源文件<br>✓ FNOS 容器需在「高级设置 → 功能」勾选 NET_RAW；实验性认证还需 NET_ADMIN<br>✗ 镜像口不能主动发 IGMP/FCC，因此不能代表 rtp2httpd 可直接播放</p>
               </article>
             </div>
           </details>
@@ -79,15 +79,15 @@
         <section class="home-steps">
           <article>
             <strong>1. 运营商频道发现（主入口）</strong>
-            <span>填写机顶盒 IP，点击「开始捕获」后重启机顶盒，系统自动从 STB 开机流量中解析频道表与 DHCP 认证信息（MAC / IPTV IP / Option60 等），一键「导入到频道线路」。</span>
+            <span>填写机顶盒 IP，点击「开始捕获」后重启机顶盒，系统自动从 STB 开机流量中解析频道表与 DHCP 认证信息（MAC / IPTV IP / Option60 等），一键导入到频道库。</span>
           </article>
           <article>
             <strong>2. IPTV 认证（需要主动播放时）</strong>
             <span>FCC 服务器、回看服务器与组播流均在 IPTV 子网，未认证时 rtp2httpd 不可达。完成 IPTV 认证后，FCC 快速换台和回看才能正常工作。</span>
           </article>
           <article>
-            <strong>3. 频道线路与导出</strong>
-            <span>确认频道名称、分组、主源和备线，导出最佳线路、全部线路或 HLS 播放列表。认证完成后可勾选「导出前线路健康检查」，自动选出可用主源。</span>
+            <strong>3. 订阅中心</strong>
+            <span>从频道库选定要看的频道，加入候选清单。播放器使用固定的动态订阅地址；频道源、FCC 或回看地址刷新后，无需重新导入订阅。</span>
           </article>
           <article>
             <strong>4. 播放诊断</strong>
@@ -95,7 +95,7 @@
           </article>
           <article>
             <strong>5. EPG 与台标维护</strong>
-            <span>在「频道线路」中管理 XMLTV EPG 与台标来源，可手动刷新并重新匹配 tvg-id / tvg-logo。</span>
+            <span>在「订阅中心 → 高级设置」中管理 XMLTV EPG 与台标来源，可手动刷新并重新匹配 tvg-id / tvg-logo。</span>
           </article>
         </section>
         <div class="home-footer">
@@ -133,7 +133,11 @@
               <button id="stbDiscoveryStopBtn" class="secondary" type="button" disabled>停止 &amp; 分析</button>
               <button id="refreshInterfacesBtn" class="secondary" type="button">刷新网卡</button>
               <button id="stbDiscoveryResetBtn" class="secondary" type="button">重置</button>
-              <button id="stbDiscoveryPcapBtn" class="secondary" type="button" disabled>导出抓包文件</button>
+              <select id="stbDiscoveryArchiveSelect" aria-label="选择已归档抓包" disabled>
+                <option value="">最新归档</option>
+              </select>
+              <button id="stbDiscoveryPcapBtn" class="secondary" type="button" disabled>导出原始 PCAP</button>
+              <button id="stbDiscoveryPcapBackupBtn" class="secondary" type="button" disabled>导出 PCAP 备份 ZIP</button>
             </div>
             <div id="stbDiscoveryStatus" class="result-box muted">等待开始…</div>
           </section>
@@ -313,11 +317,49 @@
         </div>
 
         <div id="channelListTab" class="tab-panel" hidden>
-          <div class="channel-section-tabs" role="tablist" aria-label="频道线路分区">
-            <button class="tab-button active" data-cl-section="list" type="button">频道列表</button>
-            <button class="tab-button" data-cl-section="export" type="button">导出 / EPG</button>
+          <div class="channel-section-tabs" role="tablist" aria-label="订阅中心分区">
+            <button class="tab-button active" data-cl-section="subscription" type="button">订阅中心</button>
+            <button class="tab-button" data-cl-section="list" type="button">频道库</button>
+            <button class="tab-button" data-cl-section="export" type="button">高级设置 / 静态导出</button>
             <button class="tab-button" data-cl-section="snapshots" type="button">快照</button>
           </div>
+
+          <section class="card cl-section" data-cl-panel="subscription">
+            <div class="section-title">
+              <h2>订阅中心</h2>
+              <span id="subscriptionCandidateBadge" class="chip neutral">加载中</span>
+            </div>
+            <p class="muted small">把频道库中的频道加入候选清单。以下地址固定不变；运营商频道表、FCC 或回看地址刷新后，播放器下次请求会自动使用最新线路。</p>
+            <div class="form-grid compact-grid">
+              <label>
+                主订阅（推荐）
+                <div class="copy-field"><input id="subscriptionBestUrl" class="mono" type="text" readonly><button class="secondary copy-subscription-btn" data-subscription-url="best" type="button">复制</button></div>
+              </label>
+              <label>
+                全部候选订阅
+                <div class="copy-field"><input id="subscriptionAllUrl" class="mono" type="text" readonly><button class="secondary copy-subscription-btn" data-subscription-url="all" type="button">复制</button></div>
+              </label>
+              <label>
+                HLS 兼容订阅
+                <div class="copy-field"><input id="subscriptionHlsUrl" class="mono" type="text" readonly><button class="secondary copy-subscription-btn" data-subscription-url="hls" type="button">复制</button></div>
+              </label>
+              <label>
+                XMLTV EPG
+                <div class="copy-field"><input id="subscriptionEpgUrl" class="mono" type="text" readonly><button class="secondary copy-subscription-btn" data-subscription-url="epg" type="button">复制</button></div>
+              </label>
+            </div>
+            <div id="subscriptionSummary" class="result-box muted compact-result">正在读取候选频道…</div>
+            <div class="button-row mt-8">
+              <button id="subscriptionPreviewBtn" class="primary" type="button">预览主订阅</button>
+              <button id="subscriptionDownloadBtn" class="secondary" type="button">下载当前静态副本</button>
+              <button id="subscriptionResetBestBtn" class="secondary" type="button">恢复当前最佳频道</button>
+            </div>
+            <div class="section-title mt-16">
+              <h2>候选频道</h2>
+              <span class="muted small">移除后会立即从动态订阅中消失；不会删除频道库记录。</span>
+            </div>
+            <div id="subscriptionCandidateList" class="snapshot-list"><div class="sources-empty-inline">加载中…</div></div>
+          </section>
 
           <section class="card cl-section" data-cl-panel="export" hidden>
             <div class="section-title">
@@ -363,7 +405,7 @@
             <div id="epgStatusBox" class="result-box muted compact-result"></div>
             <div class="section-title mt-16">
               <h2>导出结果</h2>
-              <span class="muted">最佳线路每组只取主源；全部线路保留所有备线且每条源只写一次。不勾选则导出全部频道。</span>
+              <span class="muted">静态文件默认按订阅候选清单导出；临时勾选频道库中的条目时，只导出所勾选源。</span>
             </div>
             <div class="section-subtitle">
               <h3>rtp2httpd 配置</h3>
@@ -377,6 +419,10 @@
               <label>
                 rtp2httpd 端口
                 <input id="httpPort" type="number" min="1" max="65535" value="5140">
+              </label>
+              <label>
+                rtp2httpd 路径前缀
+                <input id="rtp2httpdPathPrefix" type="text" placeholder="fnOS 3.14.1+：/app/rtp2httpd">
               </label>
               <label>
                 播放路径
@@ -460,9 +506,10 @@
                 <label>
                   认证模式
                   <select id="epgAuthProfile">
-                    <option value="auto">自动：优先 CU-HWCTC，失败回退 CTC-HWCTC</option>
+                    <option value="cu_hwcu">联通华为 HWCU（当前设备）</option>
+                    <option value="auto">自动兼容（仅用于已确认的其他平台）</option>
                     <option value="ctc_hwctc">电信 CTC-HWCTC（supzhang/get_iptv_channels）</option>
-                    <option value="cu_hwctc">联通 / 通用 CU-HWCTC</option>
+                    <option value="cu_hwctc">联通旧版 / 通用 CU-HWCTC（兼容模式）</option>
                   </select>
                 </label>
                 <label>
@@ -488,7 +535,8 @@
                 </label>
                 <label>
                   DES / DES3 加密密钥
-                  <input id="epgDes3Key" type="text" autocomplete="off" maxlength="24" placeholder="8 / 16 / 24 位密钥，按运营商环境填写">
+                  <input id="epgDes3Key" type="password" autocomplete="new-password" maxlength="24" placeholder="8 / 16 / 24 位密钥；保存后不会再次显示">
+                  <small id="epgDes3KeyStatus">仅保存在本机数据卷，不包含在 JSON 全局备份中。</small>
                 </label>
                 <label style="grid-column: 1 / -1">
                   EPG 认证服务器（留空自动检测）
@@ -523,37 +571,39 @@
               <button id="refreshBacktvBtn" class="secondary" type="button" style="display:none">刷新回看地址</button>
               <span id="exportSettingsSaveStatus" class="muted small"></span>
             </div>
-            <div class="section-subtitle"><h3>最佳线路（每频道组只导出主源）</h3></div>
+            <div class="section-subtitle"><h3>最佳来源（每频道组只导出主源）</h3></div>
             <div class="form-grid compact-grid" style="margin-bottom: 8px">
               <label class="checkbox-label align-self-center" style="grid-column: 1 / -1">
                 <input id="preExportHealthCheck" type="checkbox">
-                导出前线路健康检查（需已完成 IPTV 认证，rtp2httpd 能访问组播流）
+                导出前来源健康检查（需已完成 IPTV 认证，rtp2httpd 能访问组播流）
               </label>
             </div>
             <div class="button-row">
-              <button id="clDownloadBestM3u" class="primary" type="button">播放器 M3U：最佳线路</button>
+              <button id="clDownloadBestM3u" class="primary" type="button">播放器 M3U：最佳来源</button>
               <button id="clDownloadFnosHlsM3u" class="primary" type="button">飞牛影视 HLS M3U</button>
-              <button id="clDownloadRtpBestM3u" class="primary" type="button">rtp2httpd 源文件：最佳线路</button>
+              <button id="clDownloadRtpBestM3u" class="primary" type="button">rtp2httpd 源文件：最佳来源</button>
             </div>
-            <div class="section-subtitle mt-10"><h3>全部线路</h3></div>
+            <div class="section-subtitle mt-10"><h3>全部来源</h3></div>
             <div class="button-row">
-              <button id="clDownloadAllM3u" class="secondary" type="button">播放器 M3U：全部线路</button>
-              <button id="clDownloadRtpAllM3u" class="secondary" type="button">rtp2httpd 源文件：全部线路</button>
+              <button id="clDownloadAllM3u" class="secondary" type="button">播放器 M3U：全部来源</button>
+              <button id="clDownloadRtpAllM3u" class="secondary" type="button">rtp2httpd 源文件：全部来源</button>
               <button id="clDownloadJson" class="secondary" type="button">JSON</button>
               <button id="clDownloadTxt" class="secondary" type="button">TXT</button>
               <button id="clDownloadCsv" class="secondary" type="button">CSV</button>
             </div>
-            <div id="clExportResult" class="result-box muted">「最佳线路」每个频道组只导出得分最高的主源；「全部线路」导出所有。</div>
+            <div id="clExportResult" class="result-box muted">「最佳来源」每个频道组只导出得分最高的主源；「全部来源」导出所有。</div>
           </section>
 
           <section class="card cl-section" data-cl-panel="list">
             <div class="section-title">
-              <h2>频道线路</h2>
+              <h2>频道库</h2>
               <span id="clChannelCount" class="chip neutral">0 个</span>
             </div>
             <div class="toolbar">
               <button id="clSelectAllBtn" class="secondary" type="button">全选</button>
               <button id="clClearSelBtn" class="secondary" type="button">取消全选</button>
+              <button id="clAddSelectedCandidateBtn" class="primary" type="button">加入订阅候选</button>
+              <button id="clRemoveSelectedCandidateBtn" class="secondary" type="button">从候选移除</button>
               <button id="clDeleteSelectedBtn" class="danger" type="button">删除选中</button>
               <button id="clRefreshBtn" class="secondary" type="button">刷新</button>
               <button id="clGroupViewBtn" class="secondary" type="button">分组视图</button>
@@ -577,12 +627,13 @@
                     <th class="sortable" data-sort="addr">组播地址</th>
                     <th class="sortable" data-sort="category">分类</th>
                     <th class="sortable" data-sort="epg">EPG 标识</th>
+                    <th>订阅</th>
                     <th>高清</th>
                     <th>操作</th>
                   </tr>
                 </thead>
                 <tbody id="clChannelTableBody">
-                  <tr><td colspan="7" class="empty">频道列表为空，请先完成运营商频道发现并导入。</td></tr>
+                  <tr><td colspan="8" class="empty">频道列表为空，请先完成运营商频道发现并导入。</td></tr>
                 </tbody>
               </table>
             </div>
@@ -593,7 +644,7 @@
                   <tr>
                     <th class="w-28"><input type="checkbox" id="clGroupSelectAll"></th>
                     <th class="w-28"></th>
-                    <th>频道 / 线路</th>
+                    <th>频道 / 来源</th>
                     <th class="w-82">角色</th>
                     <th>技术 / FCC</th>
                     <th class="w-128">最近状态</th>
@@ -674,7 +725,7 @@
         <h2 id="channelEditTitle">编辑频道信息</h2>
         <span id="channelEditAddress" class="muted small mono"></span>
       </div>
-      <p class="task-description">修改后将用于后续线路导出。自动识别结果会单独保留，可随时恢复。</p>
+      <p class="task-description">修改后将用于后续来源导出。自动识别结果会单独保留，可随时恢复。</p>
       <div class="form-grid">
         <label>
           频道名称

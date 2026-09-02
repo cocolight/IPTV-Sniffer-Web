@@ -290,6 +290,68 @@ def _split_http_responses(raw: bytes) -> list[tuple[str, bytes]]:
     return responses
 
 
+def _iter_http_requests(raw: bytes) -> list[tuple[str, str, bytes, list[str], list[str]]]:
+    """Return complete HTTP requests with only cookie *names* as metadata.
+
+    The raw request is deliberately returned as bytes so it can be preserved
+    in the private STB evidence archive.  Callers must never place it in an
+    API response, log line, or global JSON backup because forms may contain
+    Authenticator, UserToken, and passwords.
+    """
+    found: list[tuple[str, str, bytes, list[str], list[str]]] = []
+    cursor = 0
+    request_re = re.compile(br"(?:GET|POST)\s+([^\s]+)\s+HTTP/[0-9.]+\r\n")
+    while cursor < len(raw):
+        match = request_re.search(raw, cursor)
+        if not match:
+            break
+        start = match.start()
+        header_end = raw.find(b"\r\n\r\n", start)
+        if header_end < 0:
+            break
+        header_text = raw[start:header_end].decode("latin1", errors="replace")
+        lines = header_text.split("\r\n")
+        first = lines[0].split()
+        method = first[0] if first else ""
+        path = first[1] if len(first) > 1 else ""
+        content_length = 0
+        cookie_names: list[str] = []
+        header_names: list[str] = []
+        for line in lines[1:]:
+            if ":" not in line:
+                continue
+            name, value = line.split(":", 1)
+            name = name.strip().lower()
+            header_names.append(name)
+            if name == "content-length":
+                try:
+                    content_length = max(0, int(value.strip()))
+                except ValueError:
+                    content_length = 0
+            elif name == "cookie":
+                cookie_names.extend(
+                    item.split("=", 1)[0].strip()
+                    for item in value.split(";") if "=" in item
+                )
+        end = header_end + 4 + content_length
+        if end > len(raw):
+            cursor = header_end + 4
+            continue
+        found.append((method, path, raw[start:end], sorted(set(cookie_names)), header_names))
+        cursor = end
+    return found
+
+
+def _response_cookie_names(raw: bytes) -> list[str]:
+    """Extract only cookie names from a raw server stream for safe manifests."""
+    names: list[str] = []
+    for headers, _body in _split_http_responses(raw):
+        for line in headers.split("\r\n")[1:]:
+            if line.lower().startswith("set-cookie:") and "=" in line:
+                names.append(line.split(":", 1)[1].strip().split("=", 1)[0])
+    return sorted(set(name for name in names if name))
+
+
 def _reassemble_tcp_streams(pcap_path: str) -> dict[tuple[str, int, str, int], bytes]:
     """Read a pcap file and reassemble TCP payload streams by 4-tuple key.
 
@@ -365,11 +427,32 @@ def _reassemble_tcp_streams(pcap_path: str) -> dict[tuple[str, int, str, int], b
                 continue
             key = (src_ip, src_port, dst_ip, dst_port)
             seqs = stream_seqs.setdefault(key, {})
-            if seq not in seqs:  # skip retransmits with identical seq
+            # A partial retransmission can arrive before the full segment.
+            # Keep the longest payload for a sequence number; keeping the
+            # first packet caused form fields (STBID/STBType/STBVersion) to
+            # disappear from otherwise complete boot captures.
+            if seq not in seqs or len(payload) > len(seqs[seq]):
                 seqs[seq] = payload
     streams: dict[tuple[str, int, str, int], bytes] = {}
     for key, seq_map in stream_seqs.items():
-        streams[key] = b"".join(payload for _, payload in sorted(seq_map.items()))
+        merged = bytearray()
+        next_seq: int | None = None
+        for seq, payload in sorted(seq_map.items()):
+            if next_seq is None:
+                merged.extend(payload)
+                next_seq = seq + len(payload)
+                continue
+            if seq >= next_seq:
+                # Preserve a capture gap rather than inventing bytes.  Later
+                # HTTP parsing can still use the complete following segment.
+                merged.extend(payload)
+                next_seq = seq + len(payload)
+                continue
+            overlap = next_seq - seq
+            if overlap < len(payload):
+                merged.extend(payload[overlap:])
+                next_seq = seq + len(payload)
+        streams[key] = bytes(merged)
     return streams
 
 
@@ -849,31 +932,90 @@ def _extract_epg_credentials(streams: dict[Any, bytes], stb_ip: str) -> dict[str
     user_id, stb_id, epg_auth_host (ip:port).
     """
     result: dict[str, str] = {}
+    epg_hosts: list[str] = []
     request_streams = {k: v for k, v in streams.items() if k[0] == stb_ip}
     for (src_ip, src_port, dst_ip, dst_port), data in request_streams.items():
         text = data.decode("utf-8", errors="replace")
+        if b"/EPG/jsp/" in data or b"/EDS/jsp/" in data:
+            epg_hosts.append(f"{dst_ip}:{dst_port}")
         # UserID from /EDS/jsp/AuthenticationURL?UserID=...
         if not result.get("epg_user_id"):
-            m = re.search(r"/EDS/jsp/AuthenticationURL[^\r\n]*[?&]UserID=([^&\s\r\n/]+)", text)
+            m = re.search(r"/EDS/jsp/AuthenticationURL[^\r\n]*[?&]UserID=([^&\s\r\n/]+)", text, re.IGNORECASE)
             if m:
                 uid = urllib.parse.unquote(m.group(1)).strip()
                 if uid:
                     result["epg_user_id"] = uid
                     result.setdefault("epg_auth_host", f"{dst_ip}:{dst_port}")
-        # STBID from POST body to ValidAuthenticationHWCTC
+        # STBID from POST body to ValidAuthenticationHWCTC.  Operators use
+        # both URL query strings and x-www-form-urlencoded POST bodies, and
+        # some firmwares lowercase every field name.
         if not result.get("epg_stb_id"):
-            if "ValidAuthenticationHWCTC" in text or "authLoginHWCTC" in text:
-                m = re.search(r"[?&]?STBID=([^&\s\r\n]+)", text)
-                if m:
-                    stbid = urllib.parse.unquote(m.group(1)).strip()
-                    if stbid:
-                        result["epg_stb_id"] = stbid
+            if any(marker in text for marker in (
+                "ValidAuthenticationHWCU", "authLoginHWCU",
+                "ValidAuthenticationHWCTC", "authLoginHWCTC",
+            )):
+                stbid = _extract_request_field(text, "STBID", "DeviceID", "TerminalID")
+                if stbid:
+                    result["epg_stb_id"] = stbid
                 result.setdefault("epg_auth_host", f"{dst_ip}:{dst_port}")
+        # The HWCU validation POST carries the device/profile fields required
+        # to refresh a future legal session.  Persist field values only in
+        # owner-local state; the status API and protocol manifest stay redacted.
+        if any(marker in text for marker in (
+            "ValidAuthenticationHWCU", "authLoginHWCU",
+            "ValidAuthenticationHWCTC", "authLoginHWCTC",
+        )):
+            for source, destination in (
+                ("STBType", "epg_stb_type"),
+                ("STBVersion", "epg_stb_version"),
+                ("NetUserID", "epg_net_user_id"),
+                ("conntype", "epg_conn_type"),
+                ("Lang", "epg_lang"),
+                ("AccessUserName", "access_user_name"),
+            ):
+                if not result.get(destination):
+                    value = _extract_request_field(text, source)
+                    if value:
+                        result[destination] = value
+            if not result.get("epg_user_agent"):
+                user_agent = re.search(r"(?im)^User-Agent:\s*([^\r\n]+)", text)
+                if user_agent:
+                    result["epg_user_agent"] = user_agent.group(1).strip()
         # EPG host from any /EPG/jsp/ or /EDS/jsp/ request
         if not result.get("epg_auth_host"):
             if b"/EPG/jsp/" in data or b"/EDS/jsp/" in data:
                 result["epg_auth_host"] = f"{dst_ip}:{dst_port}"
+    if epg_hosts:
+        def _epg_host_priority(host: str) -> tuple[int, str]:
+            try:
+                port = int(host.rsplit(":", 1)[1])
+            except (IndexError, ValueError):
+                port = 0
+            # 8082 is the standard IPTV EDS port.  A boot capture can also
+            # contain SOAP/control traffic on another port before the EDS GET.
+            return ({8082: 0, 80: 1, 8080: 2}.get(port, 10), host)
+        result["epg_auth_host"] = sorted(set(epg_hosts), key=_epg_host_priority)[0]
     return result
+
+
+def _extract_request_field(text: str, *field_names: str) -> str:
+    """Return a URL/form/JSON request value without making field names case-sensitive."""
+    if not text or not field_names:
+        return ""
+    names = "|".join(re.escape(name) for name in field_names)
+    patterns = (
+        # Query string and application/x-www-form-urlencoded body.
+        rf"(?im)(?:^|[?&\r\n])(?:{names})=([^&\s\r\n]+)",
+        # JSON portal payloads used by newer STB firmware.
+        rf"(?is)\"(?:{names})\"\s*:\s*\"([^\"]+)\"",
+    )
+    for pattern in patterns:
+        m = re.search(pattern, text)
+        if m:
+            value = urllib.parse.unquote_plus((m.group(1) or "").strip())
+            if value:
+                return value
+    return ""
 
 
 def _detect_timeshift_host(streams: dict[Any, bytes], channels: list[dict[str, Any]]) -> str:
@@ -943,27 +1085,37 @@ def _extract_ctc_portal_auth(streams: dict[Any, bytes], stb_ip: str) -> dict[str
                     if stb_model:
                         result["epg_stb_type"] = stb_model.group(0)
         if not result.get("epg_user_id"):
-            m = re.search(r"(?:/auth[^\r\n]*[?&]UserID=|[?&]UserID=)([^&\s\r\n]+)", text)
-            if not m:
-                m = re.search(r'"(?:UserID|userID|userId)"\s*:\s*"([^"]+)"', text)
-            if m:
-                result["epg_user_id"] = urllib.parse.unquote(m.group(1)).strip()
+            user_id = _extract_request_field(text, "UserID", "NetUserID")
+            if user_id:
+                result["epg_user_id"] = user_id
         if not result.get("epg_stb_id"):
-            m = re.search(r"[?&]STBID=([^&\s\r\n]+)", text)
-            if m:
-                result["epg_stb_id"] = urllib.parse.unquote(m.group(1)).strip()
+            stb_id = _extract_request_field(text, "STBID", "DeviceID", "TerminalID")
+            if stb_id:
+                result["epg_stb_id"] = stb_id
         if not result.get("access_user_name"):
-            m = re.search(r"[?&]AccessUserName=([^&\s\r\n]+)", text)
-            if m:
-                result["access_user_name"] = urllib.parse.unquote(m.group(1)).strip()
+            access_user_name = _extract_request_field(text, "AccessUserName")
+            if access_user_name:
+                result["access_user_name"] = access_user_name
+        if not result.get("epg_net_user_id"):
+            net_user_id = _extract_request_field(text, "NetUserID")
+            if net_user_id:
+                result["epg_net_user_id"] = net_user_id
+        if not result.get("epg_conn_type"):
+            conn_type = _extract_request_field(text, "conntype", "ConnType")
+            if conn_type:
+                result["epg_conn_type"] = conn_type
+        if not result.get("epg_lang"):
+            lang = _extract_request_field(text, "Lang", "lang")
+            if lang:
+                result["epg_lang"] = lang
         if not result.get("epg_stb_type"):
-            m = re.search(r"[?&]STBType=([^&\s\r\n]+)", text)
-            if m:
-                result["epg_stb_type"] = urllib.parse.unquote(m.group(1)).strip()
+            stb_type = _extract_request_field(text, "STBType", "DeviceType", "TerminalType")
+            if stb_type:
+                result["epg_stb_type"] = stb_type
         if not result.get("epg_stb_version"):
-            m = re.search(r"[?&]STBVersion=([^&\s\r\n]+)", text)
-            if m:
-                result["epg_stb_version"] = urllib.parse.unquote(m.group(1)).strip()
+            stb_version = _extract_request_field(text, "STBVersion", "DeviceVersion", "TerminalVersion")
+            if stb_version:
+                result["epg_stb_version"] = stb_version
         if "/uploadAuthInfo" in text:
             result.setdefault("token_path", "/uploadAuthInfo")
 
@@ -1110,9 +1262,18 @@ class StbDiscoveryService:
     STATUS_DONE = "done"
     STATUS_ERROR = "error"
 
-    def __init__(self, logger: AppLogger, token_store: Any | None = None) -> None:
+    def __init__(
+        self,
+        logger: AppLogger,
+        token_store: Any | None = None,
+        archive_dir: Path | None = None,
+    ) -> None:
         self.logger = logger
         self.token_store = token_store
+        token_path = getattr(token_store, "path", None)
+        self.archive_dir = archive_dir or (
+            Path(token_path).parent / "stb-captures" if token_path else None
+        )
         self._lock = threading.RLock()
         self._state: dict[str, Any] = {
             "status": self.STATUS_IDLE,
@@ -1124,6 +1285,8 @@ class StbDiscoveryService:
             "channels": [],
             "channel_count": 0,
             "auth_info": {},
+            "archived_pcap": "",
+            "protocol_artifacts": {"saved": False},
         }
         self._proc: subprocess.Popen | None = None
         self._pcap_path: str | None = None
@@ -1145,6 +1308,224 @@ class StbDiscoveryService:
             if path and os.path.exists(path):
                 return path
             return ""
+
+    def archive_path(self, name: str) -> Path | None:
+        """Resolve one persisted capture without accepting path traversal."""
+        name = str(name or "").strip()
+        if not self.archive_dir or not name or Path(name).name != name:
+            return None
+        if not name.startswith("stb-boot-") or not name.endswith(".pcap"):
+            return None
+        path = self.archive_dir / name
+        return path if path.is_file() else None
+
+    def list_archives(self) -> list[dict[str, Any]]:
+        """Return only non-sensitive metadata for locally persisted captures."""
+        if not self.archive_dir:
+            return []
+        result: list[dict[str, Any]] = []
+        for path in self.archive_dir.glob("stb-boot-*.pcap"):
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            result.append({
+                "name": path.name,
+                "size": stat.st_size,
+                "created_at": int(stat.st_mtime),
+                "has_manifest": (self.archive_dir / f"{path.stem}.artifacts" / "manifest.json").is_file(),
+            })
+        return sorted(result, key=lambda item: (item["created_at"], item["name"]), reverse=True)
+
+    def latest_archive_path(self) -> Path | None:
+        archives = self.list_archives()
+        return self.archive_path(str(archives[0]["name"])) if archives else None
+
+    def _archive_pcap(self, pcap_path: str | None, stopped_at: float) -> str:
+        """Persist a completed raw capture in the data volume for offline replay.
+
+        PCAP files can contain IPTV credentials.  They are therefore kept
+        locally only, permissioned for the container user, excluded from the
+        JSON global backup, and never emitted through status/log responses.
+        """
+        if not self.archive_dir or not pcap_path or not os.path.isfile(pcap_path):
+            return ""
+        try:
+            self.archive_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(stopped_at))
+            suffix = f"-{time.time_ns() % 1_000_000_000:09d}"
+            target = self.archive_dir / f"stb-boot-{stamp}{suffix}.pcap"
+            shutil.copy2(pcap_path, target)
+            os.chmod(target, 0o600)
+            return target.name
+        except Exception as exc:
+            self.logger.warning(f"STB 原始抓包归档失败：{exc}")
+            return ""
+
+    @staticmethod
+    def _write_private_artifact(path: Path, content: bytes) -> None:
+        """Atomically write a credential-bearing artifact with owner-only mode."""
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        temp_path = path.with_name(f".{path.name}.{time.time_ns()}.tmp")
+        try:
+            temp_path.write_bytes(content)
+            os.chmod(temp_path, 0o600)
+            os.replace(temp_path, path)
+            os.chmod(path, 0o600)
+        finally:
+            try:
+                if temp_path.exists():
+                    temp_path.unlink()
+            except OSError:
+                pass
+
+    def _persist_protocol_artifacts(
+        self,
+        pcap_path: str,
+        archive_name: str,
+        streams: dict[tuple[str, int, str, int], bytes] | None = None,
+    ) -> dict[str, Any]:
+        """Persist only a redacted protocol-capture summary beside a PCAP.
+
+        The raw PCAP remains the user-controlled local capture.  This helper
+        deliberately does *not* duplicate request bodies, authentication
+        forms, token values, cookies, or complete response streams.  That
+        keeps restart diagnostics useful without creating a new credential
+        export surface; the summary is also excluded from global JSON backup.
+        """
+        if not self.archive_dir:
+            return {"saved": False, "reason": "archive_unconfigured"}
+        streams = streams if streams is not None else _reassemble_tcp_streams(pcap_path)
+        artifact_dir = self.archive_dir / f"{Path(archive_name).stem}.artifacts"
+        artifact_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        selected: list[dict[str, Any]] = []
+        response_stream_keys: set[tuple[str, int, str, int]] = set()
+        auth_paths = (
+            "/eds/jsp/authenticationurl",
+            "/epg/jsp/authlogin",
+            "/epg/jsp/validauthentication",
+            "/uploadauthinfo",
+            "/getservicelist",
+        )
+        channel_paths = ("channelacquire", "getchannellist", "getallchannel")
+        for stream_key, raw in streams.items():
+            src_ip, src_port, dst_ip, dst_port = stream_key
+            for method, path, request_raw, cookie_names, header_names in _iter_http_requests(raw):
+                normalized_path = urllib.parse.urlsplit(path).path
+                lowered = normalized_path.lower()
+                category = ""
+                if any(marker in lowered for marker in auth_paths):
+                    category = "auth_form"
+                elif any(marker in lowered for marker in channel_paths):
+                    category = "channel_request"
+                if not category:
+                    continue
+                reverse_key = (dst_ip, dst_port, src_ip, src_port)
+                response_raw = streams.get(reverse_key, b"")
+                if response_raw:
+                    response_stream_keys.add(reverse_key)
+                selected.append({
+                    "kind": category,
+                    "method": method,
+                    "path": normalized_path,
+                    "request_bytes": len(request_raw),
+                    "request_has_cookie": bool(cookie_names),
+                    "request_header_names": header_names,
+                    "response_observed": bool(response_raw),
+                    "response_sets_cookie": bool(_response_cookie_names(response_raw)),
+                })
+        manifest = {
+            "schema_version": 1,
+            "source_pcap": Path(archive_name).name,
+            "created_at": int(time.time()),
+            "global_backup_excluded": True,
+            "auth_form_count": sum(item["kind"] == "auth_form" for item in selected),
+            "channel_request_count": sum(item["kind"] == "channel_request" for item in selected),
+            "response_stream_count": len(response_stream_keys),
+            "artifacts": selected,
+        }
+        self._write_private_artifact(
+            artifact_dir / "manifest.json",
+            json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"),
+        )
+        return {
+            "saved": bool(selected),
+            "auth_forms": manifest["auth_form_count"],
+            "channel_requests": manifest["channel_request_count"],
+            "response_streams": manifest["response_stream_count"],
+        }
+
+    def reanalyze_latest_archive(self, stb_ip: str) -> dict[str, Any]:
+        """Rebuild discovery state from the newest persisted PCAP.
+
+        This is intentionally offline: it does not start tcpdump or touch the
+        network interface, so parser improvements can be tested without
+        requiring the user to reboot the STB again.
+        """
+        if not self.archive_dir:
+            raise RuntimeError("未配置 STB 抓包归档目录")
+        archives = sorted(
+            self.archive_dir.glob("stb-boot-*.pcap"),
+            key=lambda path: path.stat().st_mtime,
+        )
+        if not archives:
+            raise RuntimeError("暂无已归档的 STB 抓包文件")
+        with self._lock:
+            if self._state["status"] == self.STATUS_CAPTURING:
+                raise RuntimeError("正在捕获 STB 流量，请停止后再离线解析")
+
+        pcap_path = str(archives[-1])
+        streams = _reassemble_tcp_streams(pcap_path)
+        protocol_artifacts = self._persist_protocol_artifacts(pcap_path, archives[-1].name, streams)
+        channels = analyze_pcap_for_channels(pcap_path, stb_ip)
+        timeshift_host = _detect_timeshift_host(streams, channels)
+        auth_info = _extract_dhcp_from_pcap(pcap_path)
+        epg_creds = _extract_epg_credentials(streams, stb_ip)
+        portal_auth = _extract_ctc_portal_auth(streams, stb_ip)
+        if portal_auth.get("epg_user_id") and not epg_creds.get("epg_user_id"):
+            epg_creds["epg_user_id"] = str(portal_auth["epg_user_id"])
+        if portal_auth.get("epg_stb_id") and not epg_creds.get("epg_stb_id"):
+            epg_creds["epg_stb_id"] = str(portal_auth["epg_stb_id"])
+        if portal_auth.get("portal_auth_host") and not epg_creds.get("epg_auth_host"):
+            epg_creds["epg_auth_host"] = str(portal_auth["portal_auth_host"])
+        for key in ("epg_user_agent", "epg_stb_type", "epg_stb_version", "access_user_name"):
+            if portal_auth.get(key) and not epg_creds.get(key):
+                epg_creds[key] = str(portal_auth[key])
+        token = str(portal_auth.get("user_token") or "").strip()
+        if token and self.token_store:
+            self.token_store.save_token({
+                "token": token,
+                "sip": stb_ip,
+                "sport": None,
+                "dip": portal_auth.get("server_ip", ""),
+                "dport": portal_auth.get("server_port"),
+                "path": portal_auth.get("token_path") or "/uploadAuthInfo",
+                "captured_at": int(time.time()),
+            })
+        safe_portal_auth: dict[str, Any] = {}
+        for key in ("portal_auth_host", "server_ip", "server_port", "token_path"):
+            if portal_auth.get(key):
+                safe_portal_auth[key] = portal_auth[key]
+        safe_portal_auth["has_ctc_auth_info"] = bool(portal_auth.get("ctc_auth_info"))
+        safe_portal_auth["has_upload_user_token"] = bool(portal_auth.get("user_token"))
+        safe_portal_auth["has_x_frame_session_id"] = bool(portal_auth.get("x_frame_session_id"))
+        with self._lock:
+            self._state.update({
+                "status": self.STATUS_DONE,
+                "stb_ip": stb_ip,
+                "stopped_at": time.time(),
+                "error": None,
+                "channels": channels,
+                "channel_count": len(channels),
+                "auth_info": auth_info,
+                "timeshift_host": timeshift_host,
+                "epg_creds": epg_creds,
+                "portal_auth": safe_portal_auth,
+                "archived_pcap": archives[-1].name,
+                "protocol_artifacts": protocol_artifacts,
+            })
+            self._state.update(self._pcap_meta_locked())
+            return dict(self._state)
 
     def _live_watcher(self, pcap_path: str, stb_ip: str) -> None:
         while True:
@@ -1171,9 +1552,12 @@ class StbDiscoveryService:
         with self._lock:
             state = dict(self._state)
             state.update(self._pcap_meta_locked())
-            return state
+        archives = self.list_archives()
+        state["archive_count"] = len(archives)
+        state["latest_archive"] = archives[0] if archives else None
+        return state
 
-    def start(self, stb_ip: str, interface: str = "any") -> None:
+    def start(self, stb_ip: str, interface: str = "any", full_capture: bool = False) -> None:
         rt = self.runtime_check()
         if not rt["ok"]:
             raise RuntimeError("；".join(rt["errors"]))
@@ -1190,6 +1574,7 @@ class StbDiscoveryService:
                 "status": self.STATUS_CAPTURING,
                 "stb_ip": stb_ip,
                 "interface": interface,
+                "full_capture": bool(full_capture),
                 "started_at": time.time(),
                 "stopped_at": None,
                 "error": None,
@@ -1200,14 +1585,19 @@ class StbDiscoveryService:
                 "auth_info": {},
                 "pcap_available": False,
                 "pcap_size": 0,
+                "protocol_artifacts": {"saved": False},
             }
         cmd = [
             "tcpdump",
             "-i", interface,
             "-s", "0",
             "-w", self._pcap_path,
-            f"(host {stb_ip} and tcp) or (udp and (port 67 or port 68))",
         ]
+        if not full_capture:
+            # Keep the complete STB session for later offline analysis: RTSP
+            # control is TCP, while the negotiated media path can be UDP/RTP.
+            # DHCP is included before the STB address is assigned.
+            cmd.append(f"host {stb_ip} or (udp and (port 67 or port 68))")
         self.logger.info(f"开始捕获 STB 开机流量：STB={stb_ip}，接口={interface}，文件={self._pcap_path}")
         try:
             self._proc = subprocess.Popen(
@@ -1250,6 +1640,11 @@ class StbDiscoveryService:
                 except Exception:
                     pass
 
+        archived_pcap = self._archive_pcap(pcap_path, float(self._state.get("stopped_at") or time.time()))
+        if archived_pcap:
+            with self._lock:
+                self._state["archived_pcap"] = archived_pcap
+
         def _analyze() -> None:
             try:
                 time.sleep(0.5)  # let pcap flush
@@ -1258,8 +1653,14 @@ class StbDiscoveryService:
                 timeshift_host: str = ""
                 epg_creds: dict[str, str] = {}
                 portal_auth: dict[str, Any] = {}
+                protocol_artifacts: dict[str, Any] = {"saved": False}
                 if pcap_path and os.path.exists(pcap_path):
                     streams = _reassemble_tcp_streams(pcap_path)
+                    protocol_artifacts = self._persist_protocol_artifacts(
+                        pcap_path,
+                        archived_pcap or Path(pcap_path).name,
+                        streams,
+                    )
                     channels = analyze_pcap_for_channels(pcap_path, stb_ip or "")
                     timeshift_host = _detect_timeshift_host(streams, channels)
                     auth_info = _extract_dhcp_from_pcap(pcap_path)
@@ -1301,13 +1702,15 @@ class StbDiscoveryService:
                     self._state["timeshift_host"] = timeshift_host
                     self._state["epg_creds"] = epg_creds
                     self._state["portal_auth"] = safe_portal_auth
+                    self._state["protocol_artifacts"] = protocol_artifacts
                     self._state.update(self._pcap_meta_locked())
                 has_auth = bool(auth_info.get("mac") or auth_info.get("assigned_ip"))
                 self.logger.info(
                     f"STB 频道发现完成：共发现 {len(channels)} 个频道，"
-                    f"认证信息：{'已提取（MAC=' + auth_info.get('mac','') + '）' if has_auth else '未捕获到 DHCP'}"
-                    + (f"，EPG 认证信息：UserID={epg_creds.get('epg_user_id','')} STBID={epg_creds.get('epg_stb_id','')} Host={epg_creds.get('epg_auth_host','')}" if epg_creds else "")
-                    + (f"，CTC门户：CTCGetAuthInfo={'已捕获' if portal_auth.get('ctc_auth_info') else '未捕获'} UserToken={'已捕获' if portal_auth.get('user_token') else '未捕获'}" if portal_auth else "")
+                    f"DHCP认证字段：{'已捕获' if has_auth else '未捕获'}，"
+                    f"EPG字段：{'已捕获' if epg_creds else '未捕获'}，"
+                    f"门户会话字段：{'已捕获' if portal_auth else '未捕获'}，"
+                    f"原始PCAP归档：{'已保存' if archived_pcap else '失败'}"
                 )
             except Exception as exc:
                 self.logger.error(f"STB 频道发现分析失败：{exc}")
@@ -1344,6 +1747,8 @@ class StbDiscoveryService:
                 "channels": [],
                 "channel_count": 0,
                 "auth_info": {},
+                "archived_pcap": "",
+                "protocol_artifacts": {"saved": False},
                 "pcap_available": False,
                 "pcap_size": 0,
             }

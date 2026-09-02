@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import tempfile
 import threading
@@ -60,6 +61,47 @@ class SettingsStore:
             current.update(data)
             _atomic_dump_json(self.path, current)
             return current
+
+
+class LocalSecretStore:
+    """Owner-only local storage for IPTV EPG recovery material.
+
+    This file lives in the persistent data volume so a locally authorized key
+    survives container replacement.  It is intentionally separate from
+    settings.json: public settings responses and JSON backup exports must not
+    contain it.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._lock = threading.RLock()
+
+    def get_epg_key(self) -> str:
+        with self._lock:
+            data = _safe_load_json(self.path, {})
+            if not isinstance(data, dict):
+                return ""
+            return str(data.get("epg_des3_key") or "").strip()
+
+    def has_epg_key(self) -> bool:
+        return bool(self.get_epg_key())
+
+    def set_epg_key(self, value: str) -> bool:
+        value = str(value or "").strip()
+        if not value:
+            return False
+        with self._lock:
+            self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            _atomic_dump_json(self.path, {"epg_des3_key": value})
+            os.chmod(self.path, 0o600)
+            return True
+
+    def clear_epg_key(self) -> None:
+        with self._lock:
+            try:
+                self.path.unlink()
+            except FileNotFoundError:
+                pass
 
 
 class ChannelStore:
@@ -151,6 +193,14 @@ class ChannelStore:
                     continue
                 data[key] = {
                     "key": key,
+                    # Operator imports provide c-<ChannelID>.  For manually
+                    # maintained sources use a key-derived fallback so renaming
+                    # a channel never changes its public subscription URL.
+                    "stable_id": str(
+                        row.get("stable_id")
+                        or data.get(key, {}).get("stable_id")
+                        or f"m-{hashlib.sha1(key.encode('utf-8')).hexdigest()[:16]}"
+                    ).strip(),
                     "host": host,
                     "port": port,
                     "name": name,
@@ -371,7 +421,10 @@ class StbTokenStore:
             history = data.get("history")
             if not isinstance(history, list):
                 history = []
-            return {"latest": data.get("latest"), "history": history[-100:]}
+            result = {"latest": data.get("latest"), "history": history[-100:]}
+            if isinstance(data.get("auth_info"), dict):
+                result["auth_info"] = data["auth_info"]
+            return result
 
     def load_auth_info(self) -> dict[str, Any]:
         with self._lock:
@@ -393,7 +446,12 @@ class StbTokenStore:
         if not token:
             return False
         with self._lock:
-            data = self.load()
+            # Read the full record here.  ``load()`` intentionally presents a
+            # compact token view to callers, but the on-disk record also owns
+            # the DHCP/MAC identity needed to restore IPTV authentication.
+            data = _safe_load_json(self.path, {"latest": None, "history": []})
+            if not isinstance(data, dict):
+                data = {"latest": None, "history": []}
             latest = data.get("latest") or {}
             if latest.get("token") == token and latest.get("dip") == record.get("dip"):
                 return False
@@ -408,7 +466,8 @@ class StbTokenStore:
             }
             history = list(data.get("history") or [])
             history.append(payload)
-            data = {"latest": payload, "history": history[-100:]}
+            data["latest"] = payload
+            data["history"] = history[-100:]
             _atomic_dump_json(self.path, data)
             return True
 
@@ -464,6 +523,41 @@ class ChannelSnapshotStore:
             data.pop(snap_id)
             _atomic_dump_json(self.path, data)
             return True
+
+
+class SubscriptionStore:
+    """Persist the owner-selected logical channels for dynamic subscriptions."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._lock = threading.RLock()
+
+    def load(self) -> dict[str, Any]:
+        with self._lock:
+            data = _safe_load_json(self.path, {})
+            if not isinstance(data, dict):
+                data = {}
+            ids = data.get("candidate_ids")
+            if not isinstance(ids, list):
+                ids = []
+            return {
+                "initialized": bool(data.get("initialized")),
+                "candidate_ids": [str(item).strip() for item in ids if str(item).strip()],
+                "updated_at": int(data.get("updated_at") or 0),
+            }
+
+    def save(self, candidate_ids: list[str]) -> dict[str, Any]:
+        with self._lock:
+            seen: set[str] = set()
+            normalized: list[str] = []
+            for value in candidate_ids:
+                stable_id = str(value or "").strip()
+                if stable_id and stable_id not in seen:
+                    seen.add(stable_id)
+                    normalized.append(stable_id)
+            payload = {"initialized": True, "candidate_ids": normalized, "updated_at": int(time.time())}
+            _atomic_dump_json(self.path, payload)
+            return dict(payload)
 
 
 class OperatorChannelStore:

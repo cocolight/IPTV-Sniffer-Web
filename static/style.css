@@ -196,6 +196,9 @@ details summary {
 .form-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; margin-bottom: 12px; min-width: 0; }
 .form-grid > * { min-width: 0; }
 .form-grid.compact-grid { grid-template-columns: minmax(220px, 1.2fr) minmax(280px, 2fr); align-items: end; }
+.copy-field { display: flex; gap: 6px; min-width: 0; }
+.copy-field input { min-width: 0; flex: 1 1 auto; }
+.copy-field button { flex: 0 0 auto; }
 .form-grid.watch-grid { grid-template-columns: minmax(220px, 1.3fr) minmax(130px, .8fr) minmax(220px, 1.1fr) minmax(260px, 1.4fr); align-items: end; }
 .auto-grid { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 8px; min-width: 0; }
 .auto-grid .checkbox-label { flex: 0 0 150px; }

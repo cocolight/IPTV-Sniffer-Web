@@ -135,10 +135,19 @@ def _session_expiry_info(jar: Any) -> tuple[int | None, str]:
 def _update_backtv_from_channel_text(
     text: str,
     operator_channels: dict[str, dict[str, Any]],
-) -> tuple[int, int]:
+) -> tuple[int, int, int]:
+    """Refresh known channels and rebuild missing time-shift mappings from EPG data.
+
+    A saved live-playlist can outlive ``operator_channels.json``.  The EPG
+    response still contains the multicast endpoint and time-shift URL, so it
+    is sufficient to recreate the minimum mapping needed by the catchup
+    playlist.  This lets a restored installation recover without requiring a
+    second STB boot capture, provided its EPG authentication is available.
+    """
     blocks = re.findall(r"CUSetConfig\('Channel',\s*'([^']+)'\)", text)
     blocks += re.findall(r'CUSetConfig\("Channel",\s*"([^"]+)"\)', text)
     updated = 0
+    rebuilt = 0
     total = len(blocks)
     for block in blocks:
         raw = re.findall(r"""(\w+)=(?:"([^"]*)"|'([^']*)')""", block)
@@ -155,13 +164,51 @@ def _update_backtv_from_channel_text(
         if not m3:
             continue
         key = f"{m3.group(1)}:{m3.group(2)}"
-        if key in operator_channels:
-            operator_channels[key]["backtv_url"] = backtv
+        channel = operator_channels.get(key)
+        if channel is not None:
+            channel["backtv_url"] = backtv
+            channel["time_shift"] = True
             updated += 1
-    return updated, total
+            continue
+
+        raw_length = str(
+            pairs.get("TimeShiftLength") or pairs.get("TimeShiftLen") or ""
+        ).strip()
+        try:
+            time_shift_minutes = max(0, int(raw_length))
+        except ValueError:
+            time_shift_minutes = 0
+        name = str(
+            pairs.get("ChannelName") or pairs.get("ChannelDisplayName") or
+            pairs.get("ChannelFullName") or key
+        ).strip()
+        channel_id = str(
+            pairs.get("ChannelID") or pairs.get("ChannelCode") or
+            pairs.get("ChannelIDList") or ""
+        ).strip()
+        operator_channels[key] = {
+            "key": key,
+            "host": m3.group(1),
+            "port": int(m3.group(2)),
+            "name": name,
+            "channel_num": None,
+            "is_hd": False,
+            "time_shift": True,
+            "time_shift_days": time_shift_minutes,
+            "category": "",
+            "operator_group": "",
+            "fcc_ip": "",
+            "fcc_port": None,
+            "fec_port": None,
+            "channel_id": channel_id,
+            "backtv_url": backtv,
+            "source": "epg_refresh_rebuild",
+        }
+        rebuilt += 1
+    return updated, rebuilt, total
 
 
-def _refresh_ctc_hwctc(
+def _refresh_huawei_epg(
     settings: dict[str, Any],
     operator_channels: dict[str, dict[str, Any]],
     epg_auth_host: str,
@@ -171,11 +218,20 @@ def _refresh_ctc_hwctc(
     mac_plain: str,
     stb_ip: str,
     logger: AppLogger,
+    portal_suffix: str = "HWCTC",
 ) -> dict[str, Any]:
+    portal_suffix = str(portal_suffix or "HWCTC").upper()
+    if portal_suffix not in {"HWCU", "HWCTC"}:
+        raise ValueError("不支持的 EPG 门户协议")
+    protocol_label = "联通 HWCU" if portal_suffix == "HWCU" else "电信 CTC-HWCTC"
     user_agent = str(settings.get("epg_user_agent") or "").strip()
     stb_type = str(settings.get("epg_stb_type") or "").strip()
     stb_version = str(settings.get("epg_stb_version") or "").strip()
     access_user_name = str(settings.get("epg_access_user_name") or "").strip()
+    mac_colon = ":".join(mac_plain[index:index + 2] for index in range(0, len(mac_plain), 2))
+    net_user_id = str(settings.get("epg_net_user_id") or mac_colon).strip()
+    conn_type = str(settings.get("epg_conn_type") or "").strip()
+    lang = str(settings.get("epg_lang") or "1").strip()
     missing = []
     if not des_key:
         missing.append("DES/3DES key")
@@ -186,7 +242,7 @@ def _refresh_ctc_hwctc(
     if not stb_version:
         missing.append("STBVersion")
     if missing:
-        raise ValueError("CTC-HWCTC 回看认证缺少：" + "、".join(missing))
+        raise ValueError(f"{protocol_label} 回看认证缺少：" + "、".join(missing))
 
     base_url = f"http://{epg_auth_host}"
     opener, jar = _build_opener_with_cookies()
@@ -195,12 +251,12 @@ def _refresh_ctc_hwctc(
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "X-Requested-With": "com.android.smart.terminal.iptv",
     }
-    logger.info("CTC-HWCTC 步骤1：获取 AuthenticationURL / EncryptToken")
+    logger.info(f"{protocol_label} 步骤1：获取 AuthenticationURL / EncryptToken")
     token_url = f"{base_url}/EDS/jsp/AuthenticationURL?UserID={urllib.parse.quote(user_id)}&Action=Login"
     first_body, final_url = _request_text(opener, token_url, headers=headers, timeout=15)
     final_host = urllib.parse.urlparse(final_url).netloc or epg_auth_host
 
-    login_url = f"http://{final_host}/EPG/jsp/authLoginHWCTC.jsp"
+    login_url = f"http://{final_host}/EPG/jsp/authLogin{portal_suffix}.jsp"
     login_headers = {
         "User-Agent": user_agent,
         "Content-Type": "application/x-www-form-urlencoded",
@@ -215,7 +271,7 @@ def _refresh_ctc_hwctc(
         r"UserToken=([A-Za-z0-9+/=%]+)",
     ], combined)
     if not encrypt_token:
-        raise RuntimeError("CTC-HWCTC 未能提取 EncryptToken")
+        raise RuntimeError(f"{protocol_label} 未能取得认证挑战")
 
     rand = "".join(random.choices(string.digits, k=8))
     plain = f"{rand}${encrypt_token}${user_id}${stb_id}${stb_ip}${mac_plain}$$CTC"
@@ -225,33 +281,29 @@ def _refresh_ctc_hwctc(
     padding = str(settings.get("epg_des_padding") or "pkcs5").strip().lower()
     authenticator = _des_ecb_encrypt_hex(plain, des_key, padding=padding, crypto_mode=crypto_mode)
 
-    validate_url = f"http://{final_host}/EPG/jsp/ValidAuthenticationHWCTC.jsp"
+    validate_url = f"http://{final_host}/EPG/jsp/ValidAuthentication{portal_suffix}.jsp"
     validate_data = {
         "UserID": user_id,
-        "Lang": "",
+        "Lang": lang,
         "SupportHD": "1",
-        "NetUserID": "",
+        "NetUserID": net_user_id,
         "Authenticator": authenticator,
         "STBType": stb_type,
         "STBVersion": stb_version,
-        "conntype": "",
+        "conntype": conn_type,
         "STBID": stb_id,
         "templateName": str(settings.get("epg_template_name") or ""),
         "areaId": str(settings.get("epg_area_id") or ""),
         "userToken": encrypt_token,
         "userGroupId": "",
         "productPackageId": "",
-        "mac": mac_plain,
-        "UserField": "",
+        "mac": mac_colon,
         "SoftwareVersion": "",
-        "IsSmartStb": "undefined",
-        "desktopId": "undefined",
-        "stbmaker": "",
         "VIP": "",
     }
     if access_user_name:
         validate_data["AccessUserName"] = access_user_name
-    logger.info("CTC-HWCTC 步骤2：提交 ValidAuthenticationHWCTC 获取 JSESSIONID")
+    logger.info(f"{protocol_label} 步骤2：提交 ValidAuthentication{portal_suffix} 获取 JSESSIONID")
     validate_body, _ = _request_text(
         opener,
         validate_url,
@@ -270,25 +322,26 @@ def _refresh_ctc_hwctc(
         r'name=["\']stbid["\'][^>]+value=["\']([^"\']+)["\']',
     ], validate_body) or stb_id
     if not jsessionid:
-        raise RuntimeError("CTC-HWCTC 未获取到 JSESSIONID，请检查 key、UserAgent、STBType、STBVersion、MAC、STBID")
+        raise RuntimeError(f"{protocol_label} 未建立认证会话，请检查已合法配置的认证参数与设备信息")
 
     errors: list[str] = []
     chanlist_body = ""
-    logger.info("CTC-HWCTC 步骤3：拉取频道表并刷新回看地址")
-    for endpoint in ("getchannellistHWCTC.jsp", "getchannellistHWCU.jsp"):
+    logger.info(f"{protocol_label} 步骤3：拉取频道表并刷新回看地址")
+    suffixes = ("HWCU", "HWCTC") if portal_suffix == "HWCU" else ("HWCTC", "HWCU")
+    for endpoint in tuple(f"getchannellist{suffix}.jsp" for suffix in suffixes):
         chanlist_url = f"http://{final_host}/EPG/jsp/{endpoint}"
         try:
             body, _ = _request_text(
                 opener,
                 chanlist_url,
                 data={
-                    "conntype": "",
+                    "conntype": conn_type,
                     "UserToken": user_token,
                     "tempKey": "",
                     "stbid": stbid_from_resp,
                     "SupportHD": "1",
                     "UserID": user_id,
-                    "Lang": "1",
+                    "Lang": lang,
                 },
                 headers={"User-Agent": user_agent, "Content-Type": "application/x-www-form-urlencoded"},
                 timeout=20,
@@ -300,16 +353,17 @@ def _refresh_ctc_hwctc(
         except Exception as exc:
             errors.append(f"{endpoint}: {exc}")
     if not chanlist_body:
-        raise RuntimeError(f"CTC-HWCTC 无法获取频道表：{'; '.join(errors) or '响应为空'}")
+        raise RuntimeError(f"{protocol_label} 无法获取频道表：{'; '.join(errors) or '响应为空'}")
 
-    updated, total = _update_backtv_from_channel_text(chanlist_body, operator_channels)
+    updated, rebuilt, total = _update_backtv_from_channel_text(chanlist_body, operator_channels)
     expires_at, expiry_note = _session_expiry_info(jar)
-    logger.info(f"CTC-HWCTC 回看地址刷新完成：共解析 {total} 个频道块，更新 {updated} 个")
+    logger.info(f"{protocol_label} 回看地址刷新完成：共解析 {total} 个频道块，更新 {updated} 个，重建 {rebuilt} 个")
     return {
         "updated": updated,
+        "rebuilt": rebuilt,
         "total": total,
         "epg_host": final_host,
-        "profile": "ctc_hwctc",
+        "profile": "cu_hwcu" if portal_suffix == "HWCU" else "ctc_hwctc",
         "session": "ok",
         "token_expires_at": expires_at,
         "token_expiry_note": expiry_note,
@@ -336,7 +390,7 @@ def refresh_backtv_urls(
     mac = str(auth_info.get("mac") or "").strip().lower()
     stb_ip = str(auth_info.get("assigned_ip") or "").strip()
     profile = str(settings.get("epg_auth_profile") or "auto").strip().lower()
-    if profile not in {"auto", "ctc_hwctc", "cu_hwctc"}:
+    if profile not in {"auto", "cu_hwcu", "ctc_hwctc", "cu_hwctc"}:
         profile = "auto"
 
     # Auto-detect EPG host from backtv_url if not configured
@@ -362,24 +416,42 @@ def refresh_backtv_urls(
         raise ValueError("未找到机顶盒 IP 地址，请先完成 STB 开机捕获以记录认证信息")
 
     mac_plain = mac.replace(":", "")
-    cu_ready = bool(password)
-    ctc_ready = bool(des3_key and settings.get("epg_user_agent") and settings.get("epg_stb_type") and settings.get("epg_stb_version"))
+    # The saved STB trace for this deployment shows the Huawei CU chain:
+    # authLoginHWCU -> ValidAuthenticationHWCU.  It authenticates with the
+    # encrypted Authenticator, rather than a plaintext IPTV password field.
+    hwcu_ready = bool(
+        des3_key and settings.get("epg_user_agent") and
+        settings.get("epg_stb_type") and settings.get("epg_stb_version")
+    )
+    ctc_ready = hwcu_ready
 
-    # Auto mode tries Unicom (CU-HWCTC) first, then falls back to Telecom (CTC-HWCTC).
-    if profile in {"auto", "cu_hwctc"} and (profile == "cu_hwctc" or cu_ready):
+    # Auto mode starts with the exact HWCU protocol found in the archived STB
+    # boot capture, then keeps the former variants as compatibility fallbacks.
+    if profile in {"auto", "cu_hwcu", "cu_hwctc"} and hwcu_ready:
+        try:
+            return _refresh_huawei_epg(
+                settings, operator_channels, epg_auth_host, user_id, stb_id,
+                des3_key, mac_plain, stb_ip, logger, portal_suffix="HWCU",
+            )
+        except Exception as exc:
+            if profile == "cu_hwcu":
+                raise
+            logger.warning(f"HWCU 回看刷新失败，尝试兼容流程：{redact_sensitive_text(str(exc))}")
+
+    # Preserve the password-based CU attempt only for auto mode and only as
+    # a fallback for operators that genuinely expose that older protocol.
+    if profile in {"auto", "cu_hwctc"} and password:
         try:
             return _refresh_cu_hwctc(
                 settings, operator_channels, epg_auth_host, user_id, stb_id,
                 des3_key, password, mac_plain, stb_ip, logger,
             )
         except Exception as exc:
-            if profile == "cu_hwctc":
-                raise
-            logger.warning(f"CU-HWCTC 回看刷新失败，尝试 CTC-HWCTC 回退：{redact_sensitive_text(str(exc))}")
+            logger.warning(f"兼容 CU 回看刷新失败：{redact_sensitive_text(str(exc))}")
 
     if profile in {"auto", "ctc_hwctc"} and (profile == "ctc_hwctc" or ctc_ready):
         try:
-            return _refresh_ctc_hwctc(
+            return _refresh_huawei_epg(
                 settings, operator_channels, epg_auth_host, user_id, stb_id,
                 des3_key, mac_plain, stb_ip, logger,
             )
@@ -388,9 +460,11 @@ def refresh_backtv_urls(
                 raise
             logger.warning(f"CTC-HWCTC 回看刷新失败：{redact_sensitive_text(str(exc))}")
 
-    if not cu_ready and not ctc_ready:
-        raise ValueError("CU-HWCTC 回看刷新需要 IPTV 密码；若使用电信 CTC-HWCTC，请填写 key、UserAgent、STBType、STBVersion")
-    raise RuntimeError("CU-HWCTC 与 CTC-HWCTC 认证均失败，请检查认证参数或查看日志详情")
+    if profile == "cu_hwcu":
+        raise ValueError("联通 HWCU 回看需要已合法配置的 DES/3DES key、UserAgent、STBType、STBVersion；请在 8788 设置页面完成配置后重试")
+    if not hwcu_ready and not ctc_ready:
+        raise ValueError("已捕获的联通 HWCU 回看流程需要 DES/3DES key、UserAgent、STBType、STBVersion；请补齐缺失参数")
+    raise RuntimeError("HWCU 与 CTC-HWCTC 回看认证均失败，请检查认证参数或查看日志详情")
 
 
 def _refresh_cu_hwctc(
@@ -434,7 +508,7 @@ def _refresh_cu_hwctc(
             f"响应片段（前300字符）：{redact_sensitive_text(body[:300])}"
         )
     encrypt_token = urllib.parse.unquote(m.group(1)).strip()
-    logger.info(f"EPG EncryptToken 获取成功（前20字符）：{encrypt_token[:20]}…")
+    logger.info("EPG 认证挑战获取成功")
 
     # Step 2: build Authenticator and login
     random8 = "".join(random.choices(string.digits, k=8))
@@ -525,12 +599,13 @@ def _refresh_cu_hwctc(
 
     # Step 5: parse and update backtv_url in operator_channels
     text = chanlist_body.decode("utf-8", errors="replace")
-    updated, total = _update_backtv_from_channel_text(text, operator_channels)
+    updated, rebuilt, total = _update_backtv_from_channel_text(text, operator_channels)
     expires_at, expiry_note = _session_expiry_info(jar)
 
-    logger.info(f"EPG 回看地址刷新完成：共解析 {total} 个频道块，更新 {updated} 个")
+    logger.info(f"EPG 回看地址刷新完成：共解析 {total} 个频道块，更新 {updated} 个，重建 {rebuilt} 个")
     return {
         "updated": updated,
+        "rebuilt": rebuilt,
         "total": total,
         "epg_host": epg_auth_host,
         "profile": "cu_hwctc",

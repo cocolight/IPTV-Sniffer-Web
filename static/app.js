@@ -20,7 +20,8 @@ const state = {
   logPoller: null,
   channelList: [],
   selectedChannelKeys: new Set(),
-  channelListSection: "list",
+  channelListSection: "subscription",
+  subscription: null,
   ignoredKeys: _loadIgnoredKeys(),
 };
 
@@ -60,6 +61,7 @@ function formSettings() {
     interface: selectedInterface,
     http_host: $("httpHost").value.trim(),
     http_port: Number($("httpPort").value || 5140),
+    rtp2httpd_path_prefix: $("rtp2httpdPathPrefix")?.value.trim() || "",
     rtp2httpd_config_path: $("diagConfigPath")?.value.trim() || "",
     path_mode: $("pathMode").value,
     duration: 0,
@@ -85,9 +87,9 @@ function showHome() {
   hideChannelListSections();
 }
 
-function showChannelListSection(sectionName = "list") {
-  const allowed = new Set(["list", "export", "epg", "snapshots"]);
-  const target = allowed.has(sectionName) ? sectionName : "list";
+function showChannelListSection(sectionName = "subscription") {
+  const allowed = new Set(["subscription", "list", "export", "epg", "snapshots"]);
+  const target = allowed.has(sectionName) ? sectionName : "subscription";
   state.channelListSection = target;
   document.querySelectorAll("[data-cl-panel]").forEach((panel) => {
     panel.hidden = panel.dataset.clPanel !== target;
@@ -111,14 +113,18 @@ function showTab(tabName) {
   $("channelListTab").hidden = tabName !== "channelList";
   $("diagnoseTab").hidden = tabName !== "diagnose";
   if (tabName === "channelList") {
-    showChannelListSection(state.channelListSection || "list");
+    showChannelListSection(state.channelListSection || "subscription");
+    loadSubscription();
     loadChannelList();
     loadSnapshots();
     loadEpgSettings();
   } else {
     hideChannelListSections();
   }
-  if (tabName === "stbDiscovery") loadSavedOperatorCount();
+  if (tabName === "stbDiscovery") {
+    loadSavedOperatorCount();
+    loadStbDiscoveryState().catch(() => {});
+  }
   if (tabName === "iptvAuth") {
     initIptvAuthTab();
   }
@@ -294,6 +300,7 @@ async function loadSettings() {
   if ($("iptvAuthIface") && data.interface) $("iptvAuthIface").value = data.interface;
   $("httpHost").value = data.http_host || "";
   $("httpPort").value = data.http_port ?? 5140;
+  if ($("rtp2httpdPathPrefix")) $("rtp2httpdPathPrefix").value = data.rtp2httpd_path_prefix || "";
   if ($("diagConfigPath")) $("diagConfigPath").value = data.rtp2httpd_config_path || "";
   $("pathMode").value = data.path_mode || "rtp";
   if ($("catchupEnabled")) {
@@ -312,7 +319,17 @@ async function loadSettings() {
   if ($("iptvPassword")) $("iptvPassword").value = data.iptv_password || "";
   if ($("epgUserId")) $("epgUserId").value = data.epg_user_id || "";
   if ($("epgStbId")) $("epgStbId").value = data.epg_stb_id || "";
-  if ($("epgDes3Key")) $("epgDes3Key").value = data.epg_des3_key || "";
+  if ($("epgDes3Key")) {
+    $("epgDes3Key").value = "";
+    $("epgDes3Key").placeholder = data.epg_des3_key_configured
+      ? "已在本机保存；留空则保持不变"
+      : "8 / 16 / 24 位密钥；保存后不会再次显示";
+  }
+  if ($("epgDes3KeyStatus")) {
+    $("epgDes3KeyStatus").textContent = data.epg_des3_key_configured
+      ? "已本机保存；刷新可使用，网页和 JSON 全局备份均不会显示。"
+      : "仅保存在本机数据卷，不包含在 JSON 全局备份中。";
+  }
   if ($("epgAuthHost")) $("epgAuthHost").value = data.epg_auth_host || "";
   if ($("epgAuthProfile")) $("epgAuthProfile").value = data.epg_auth_profile || "auto";
   if ($("epgCryptoMode")) $("epgCryptoMode").value = data.epg_crypto_mode || "auto";
@@ -394,9 +411,9 @@ async function doExportDownload(filename, btn, requireHost = false) {
     $("clExportResult").className = "result-box";
     const health = data.health_check;
     const healthText = health?.checked
-      ? `导出前检查 ${health.groups_checked} 个多线路组、${health.checked} 条源：可用 ${health.ok}，失败 ${health.failed}，超时 ${health.timeout}${health.limit_reached ? "，已达检查上限" : ""}。`
+      ? `导出前检查 ${health.groups_checked} 个多来源组、${health.checked} 条源：可用 ${health.ok}，失败 ${health.failed}，超时 ${health.timeout}${health.limit_reached ? "，已达检查上限" : ""}。`
       : (health?.message || "");
-    $("clExportResult").textContent = `共 ${data.count} 条线路，分组后主源 ${data.best_count ?? data.count} 个。${healthText ? `\n${healthText}` : ""}`;
+    $("clExportResult").textContent = `共 ${data.count} 条来源，分组后主源 ${data.best_count ?? data.count} 个。${healthText ? `\n${healthText}` : ""}`;
     const a = document.createElement("a");
     a.href = `/api/download/${filename}`;
     a.download = filename;
@@ -415,6 +432,62 @@ async function loadChannelList() {
     syncSelectedChannelKeys();
     filterAndRenderChannelList();
   } catch (err) { console.warn("loadChannelList:", err.message); }
+}
+
+function subscriptionUrl(path) {
+  return `${window.location.origin}${path}`;
+}
+
+function renderSubscription(data) {
+  state.subscription = data;
+  const urls = data.urls || {};
+  const ids = {best: "subscriptionBestUrl", all: "subscriptionAllUrl", hls: "subscriptionHlsUrl", epg: "subscriptionEpgUrl"};
+  Object.entries(ids).forEach(([kind, id]) => { if ($(id)) $(id).value = subscriptionUrl(urls[kind] || ""); });
+  const total = Number(data.total_candidates || 0);
+  const badge = $("subscriptionCandidateBadge");
+  badge.className = total ? "chip ok" : "chip warning";
+  badge.textContent = `${total} 个候选频道`;
+  $("subscriptionSummary").textContent = total
+    ? `当前订阅包含 ${total} 个频道，其中回看 ${data.catchup_candidates || 0} 个、FCC ${data.fcc_candidates || 0} 个。主订阅使用固定频道 ID，不暴露运营商 RTSP 或组播源地址。`
+    : "候选清单为空。请到「频道库」勾选频道后加入订阅候选。";
+  const list = $("subscriptionCandidateList");
+  const candidates = data.candidates || [];
+  if (!candidates.length) {
+    list.innerHTML = '<div class="sources-empty-inline">暂无候选频道。到「频道库」筛选、勾选后加入即可。</div>';
+    return;
+  }
+  list.innerHTML = candidates.map((channel) => `
+    <div class="epg-source-row">
+      <span class="epg-source-name">${escapeHtml(channel.name || channel.stable_id)}</span>
+      <span class="muted small">${escapeHtml(channel.category || "其它频道")} · ${channel.has_catchup ? "回看" : "仅直播"}${channel.has_fcc ? " · FCC" : ""}</span>
+      <span class="mono small">${escapeHtml(channel.stable_id)}</span>
+      <button class="secondary xs-btn subscription-remove-btn" data-stable-id="${escapeHtml(channel.stable_id)}" type="button">移除</button>
+    </div>`).join("");
+  list.querySelectorAll(".subscription-remove-btn").forEach((btn) => {
+    btn.addEventListener("click", () => updateSubscriptionCandidates("remove", [btn.dataset.stableId]));
+  });
+}
+
+async function loadSubscription() {
+  try {
+    renderSubscription(await requestJson("/api/subscription"));
+  } catch (err) {
+    if ($("subscriptionSummary")) {
+      $("subscriptionSummary").textContent = `订阅中心加载失败：${err.message}`;
+      $("subscriptionSummary").className = "result-box error";
+    }
+  }
+}
+
+async function updateSubscriptionCandidates(action, stableIds = []) {
+  try {
+    const data = await requestJson("/api/subscription/candidates", {
+      method: "POST", body: JSON.stringify({action, stable_ids: stableIds}),
+    });
+    state.selectedChannelKeys.clear();
+    renderSubscription(data);
+    await loadChannelList();
+  } catch (err) { alert(err.message); }
 }
 
 function updateChannelCategoryFilter(categories) {
@@ -455,9 +528,11 @@ function visibleGroupKeys() {
 
 function selectedChannelRows() {
   const selected = state.selectedChannelKeys || new Set();
-  return selected.size > 0
-    ? (state.channelList || []).filter((ch) => selected.has(ch.key))
-    : (state.channelList || []);
+  if (selected.size > 0) return (state.channelList || []).filter((ch) => selected.has(ch.key));
+  const candidates = new Set(state.subscription?.candidate_ids || []);
+  return candidates.size
+    ? (state.channelList || []).filter((ch) => candidates.has(ch.stable_id))
+    : [];
 }
 
 function refreshChannelSelectionControls() {
@@ -491,7 +566,7 @@ function renderChannelList(channels) {
     : `${channels.length} / ${total} 个`;
   const tbody = $("clChannelTableBody");
   if (!channels.length) {
-    tbody.innerHTML = '<tr><td colspan="7" class="empty">频道列表为空，请先完成运营商频道发现并导入。</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="8" class="empty">频道列表为空，请先完成运营商频道发现并导入。</td></tr>';
     refreshChannelSelectionControls();
     return;
   }
@@ -506,6 +581,7 @@ function renderChannelList(channels) {
       <td class="mono small">${escapeHtml(addr)}</td>
       <td>${escapeHtml(ch.category || "")}</td>
       <td class="mono small">${escapeHtml(epg)}</td>
+      <td>${ch.subscription_candidate ? '<span class="badge hd">已加入</span>' : '<span class="muted small">未加入</span>'}</td>
       <td>${ch.is_hd ? '<span class="badge hd">高清</span>' : '<span class="muted small">—</span>'}</td>
       <td><button class="secondary xs-btn channel-edit-btn" type="button" data-key="${escapeHtml(ch.key || "")}">编辑</button></td>
     </tr>`;
@@ -627,6 +703,7 @@ function collectExportSettings() {
   return {
     http_host: $("httpHost").value.trim(),
     http_port: Number($("httpPort").value || 5140),
+    rtp2httpd_path_prefix: $("rtp2httpdPathPrefix")?.value.trim() || "",
     path_mode: $("pathMode").value,
     fcc_type: $("fccType")?.value || "",
     catchup_enabled: $("catchupEnabled")?.checked ?? false,
@@ -673,7 +750,7 @@ function scheduleExportSettingsSave() {
   exportSettingsSaveTimer = setTimeout(autoSaveExportSettings, 600);
 }
 const EXPORT_SETTINGS_TEXT_INPUT_IDS = [
-  "httpHost", "httpPort", "catchupDays", "timeshiftHost", "catchupSourceTemplate",
+  "httpHost", "httpPort", "rtp2httpdPathPrefix", "catchupDays", "timeshiftHost", "catchupSourceTemplate",
   "iptvPassword", "epgUserId", "epgStbId", "epgDes3Key", "epgAuthHost",
   "epgStbType", "epgStbVersion", "epgUserAgent", "epgAccessUserName", "catchupAutoRefreshHours",
 ];
@@ -819,6 +896,22 @@ $("clClearSelBtn").addEventListener("click", () => {
   keys.forEach((key) => setChannelSelected(key, false));
   refreshChannelSelectionControls();
 });
+$("clAddSelectedCandidateBtn").addEventListener("click", async () => {
+  const ids = [...new Set((state.channelList || [])
+    .filter((channel) => state.selectedChannelKeys.has(channel.key))
+    .map((channel) => channel.stable_id)
+    .filter(Boolean))];
+  if (!ids.length) { alert("请先在频道库中勾选至少一个频道"); return; }
+  await updateSubscriptionCandidates("add", ids);
+});
+$("clRemoveSelectedCandidateBtn").addEventListener("click", async () => {
+  const ids = [...new Set((state.channelList || [])
+    .filter((channel) => state.selectedChannelKeys.has(channel.key))
+    .map((channel) => channel.stable_id)
+    .filter(Boolean))];
+  if (!ids.length) { alert("请先在频道库中勾选至少一个频道"); return; }
+  await updateSubscriptionCandidates("remove", ids);
+});
 $("clDeleteSelectedBtn").addEventListener("click", async () => {
   const selectedKeys = [...state.selectedChannelKeys];
   if (!selectedKeys.length) { alert("请先勾选要删除的频道"); return; }
@@ -832,6 +925,29 @@ $("clDeleteSelectedBtn").addEventListener("click", async () => {
 $("clRefreshBtn").addEventListener("click", () => loadChannelList());
 $("clFilterName").addEventListener("input", filterAndRenderChannelList);
 $("clFilterCategory").addEventListener("change", filterAndRenderChannelList);
+document.querySelectorAll(".copy-subscription-btn").forEach((btn) => btn.addEventListener("click", async () => {
+  const key = btn.dataset.subscriptionUrl;
+  const value = $(key === "best" ? "subscriptionBestUrl" : key === "all" ? "subscriptionAllUrl" : key === "hls" ? "subscriptionHlsUrl" : "subscriptionEpgUrl").value;
+  try {
+    await navigator.clipboard.writeText(value);
+    const original = btn.textContent;
+    btn.textContent = "已复制";
+    setTimeout(() => { btn.textContent = original; }, 1200);
+  } catch (_) { window.prompt("请复制订阅地址", value); }
+}));
+$("subscriptionPreviewBtn").addEventListener("click", () => window.open($("subscriptionBestUrl").value, "_blank", "noopener"));
+$("subscriptionDownloadBtn").addEventListener("click", () => {
+  const a = document.createElement("a");
+  a.href = $("subscriptionBestUrl").value;
+  a.download = "iptv-subscription.m3u";
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+});
+$("subscriptionResetBestBtn").addEventListener("click", async () => {
+  if (!confirm("将候选清单恢复为当前频道库的最佳频道。是否继续？")) return;
+  await updateSubscriptionCandidates("reset_to_best");
+});
 $("backupExportBtn").addEventListener("click", () => showBackupExportDialog());
 $("backupImportBtn").addEventListener("click", () => {
   $("backupImportFile").value = "";
@@ -840,7 +956,7 @@ $("backupImportBtn").addEventListener("click", () => {
 
 const BACKUP_MODULES = [
   ["settings", "应用与导出设置"],
-  ["channels", "频道线路"],
+  ["channels", "频道库"],
   ["operator_channels", "运营商频道表"],
   ["discovered_channels", "已发现频道"],
   ["fcc", "FCC 记录"],
@@ -1123,11 +1239,21 @@ function renderStbDiscoveryStatus(state) {
   $("stbDiscoveryStartBtn").disabled = isCapturing || isAnalyzing;
   $("stbDiscoveryStopBtn").disabled = !isCapturing;
   $("stbDiscoveryResetBtn").disabled = isCapturing || isAnalyzing;
+  const latestArchive = state.latest_archive || null;
+  const exportAvailable = !!state.pcap_available || !!latestArchive;
   if ($("stbDiscoveryPcapBtn")) {
-    $("stbDiscoveryPcapBtn").disabled = !state.pcap_available;
+    $("stbDiscoveryPcapBtn").disabled = !exportAvailable;
     $("stbDiscoveryPcapBtn").title = state.pcap_available
-      ? `导出最近一次抓包文件（${Math.round((state.pcap_size || 0) / 1024)} KB）`
-      : "完成一次 STB 开机捕获后可导出";
+      ? `导出当前抓包文件（${Math.round((state.pcap_size || 0) / 1024)} KB）`
+      : latestArchive
+        ? `导出已归档 PCAP（${Math.round((latestArchive.size || 0) / 1024)} KB）`
+        : "完成一次 STB 开机捕获后可导出";
+  }
+  if ($("stbDiscoveryPcapBackupBtn")) {
+    $("stbDiscoveryPcapBackupBtn").disabled = !latestArchive;
+    $("stbDiscoveryPcapBackupBtn").title = latestArchive
+      ? `导出包含原始 PCAP 的本地备份包（共 ${state.archive_count || 1} 份归档）`
+      : "完成一次 STB 开机捕获后可导出持久化备份";
   }
 
   if (isCapturing) {
@@ -1155,6 +1281,33 @@ function renderStbDiscoveryStatus(state) {
     box.textContent = "等待开始…";
     box.className = "result-box muted";
   }
+}
+
+function renderStbDiscoveryArchives(archives) {
+  const select = $("stbDiscoveryArchiveSelect");
+  if (!select) return;
+  const previous = select.value;
+  select.innerHTML = "";
+  for (const archive of archives || []) {
+    const option = document.createElement("option");
+    option.value = archive.name || "";
+    const size = Math.max(0, Number(archive.size || 0));
+    option.textContent = `${archive.name || "未命名抓包"}（${Math.round(size / 1024)} KB）`;
+    select.appendChild(option);
+  }
+  select.disabled = !archives?.length;
+  if (previous && [...select.options].some((option) => option.value === previous)) {
+    select.value = previous;
+  }
+}
+
+async function loadStbDiscoveryState() {
+  const [status, archiveResult] = await Promise.all([
+    requestJson("/api/stb_discovery/status"),
+    requestJson("/api/stb_discovery/archives"),
+  ]);
+  renderStbDiscoveryStatus(status);
+  renderStbDiscoveryArchives(archiveResult.archives || []);
 }
 
 function renderStbDiscoveryChannels(channels) {
@@ -1186,6 +1339,7 @@ function startStbDiscoveryPoll() {
       renderStbDiscoveryStatus(data);
       if (data.status !== "capturing" && data.status !== "analyzing") {
         stopStbDiscoveryPoll();
+        loadStbDiscoveryState().catch(() => {});
       }
     } catch (_) {}
   }, 2000);
@@ -1216,6 +1370,7 @@ $("stbDiscoveryStopBtn").addEventListener("click", async () => {
     renderStbDiscoveryStatus(data);
     if (data.status === "analyzing") startStbDiscoveryPoll();
     else stopStbDiscoveryPoll();
+    if (data.status !== "capturing" && data.status !== "analyzing") loadStbDiscoveryState().catch(() => {});
   } catch (err) { alert(err.message); }
 });
 
@@ -1224,6 +1379,7 @@ $("stbDiscoveryResetBtn").addEventListener("click", async () => {
     stopStbDiscoveryPoll();
     const data = await requestJson("/api/stb_discovery/reset", {method: "POST", body: "{}"});
     renderStbDiscoveryStatus(data);
+    loadStbDiscoveryState().catch(() => {});
     $("stbDiscoveryResultSection").hidden = true;
     loadIptvAuthSummary().catch(() => {});
   } catch (err) { alert(err.message); }
@@ -1275,7 +1431,18 @@ $("stbDiscoveryImportBtn").addEventListener("click", async () => {
 
 $("stbDiscoveryPcapBtn").addEventListener("click", () => {
   const a = document.createElement("a");
-  a.href = "/api/stb_discovery/pcap";
+  const archive = $("stbDiscoveryArchiveSelect")?.value || "";
+  a.href = archive ? `/api/stb_discovery/pcap?archive=${encodeURIComponent(archive)}` : "/api/stb_discovery/pcap";
+  a.download = "";
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+});
+
+$("stbDiscoveryPcapBackupBtn")?.addEventListener("click", () => {
+  const a = document.createElement("a");
+  const archive = $("stbDiscoveryArchiveSelect")?.value || "";
+  a.href = archive ? `/api/stb_discovery/archive-backup?archive=${encodeURIComponent(archive)}` : "/api/stb_discovery/archive-backup";
   a.download = "";
   document.body.appendChild(a);
   a.click();

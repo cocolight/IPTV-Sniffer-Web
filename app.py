@@ -4,14 +4,18 @@
 from __future__ import annotations
 
 import gzip
+import hashlib
+import io
 import os
 import zlib
 import json
 import re
+import select
 import shutil
 import subprocess
 import time
 import threading
+import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
@@ -19,7 +23,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlsplit
 from urllib.request import Request, urlopen
 
-from flask import Flask, Response, jsonify, render_template, request, send_file, send_from_directory
+from flask import Flask, Response, jsonify, redirect, render_template, request, send_file, send_from_directory
 from waitress import serve
 
 from config import (
@@ -46,7 +50,9 @@ from config import (
     OUTPUT_DIR,
     SETTINGS_FILE,
     STB_TOKEN_FILE,
+    SUBSCRIPTION_FILE,
     DEFAULT_RTP2HTTPD_CONFIG_PATH,
+    EPG_KEY_FILE,
     OPERATOR_CHANNELS_FILE,
     SNAPSHOTS_FILE,
     WAITRESS_THREADS,
@@ -60,17 +66,20 @@ from services.export_service import ExportService
 from services.iptv_auth_service import IptvAuthService
 from services.log_service import AppLogger
 from services.hls_service import HlsService
+from services.rtsp_catchup_service import CombinedRtspUdpSession, RtspCatchupError
 from services.stb_discovery_service import StbDiscoveryService
-from services.storage_service import ChannelSnapshotStore, ChannelStore, DiscoveryStore, FccStore, OperatorChannelStore, SettingsStore, StbTokenStore
+from services.storage_service import ChannelSnapshotStore, ChannelStore, DiscoveryStore, FccStore, LocalSecretStore, OperatorChannelStore, SettingsStore, StbTokenStore, SubscriptionStore
 from utils import channel_group_key, channel_primary_score, channel_variant_key, classify_channel_name, natural_key, normalize_channel_name_for_group, redact_sensitive_text, valid_ip_or_host, valid_ipv4_multicast
 
 app = Flask(__name__)
 logger = AppLogger(LOG_FILE, LOG_MEMORY_LIMIT)
 settings_store = SettingsStore(SETTINGS_FILE)
+epg_key_store = LocalSecretStore(EPG_KEY_FILE)
 channel_store = ChannelStore(CHANNELS_FILE)
 fcc_store = FccStore(FCC_FILE)
 operator_channel_store = OperatorChannelStore(OPERATOR_CHANNELS_FILE)
 snapshot_store = ChannelSnapshotStore(SNAPSHOTS_FILE)
+subscription_store = SubscriptionStore(SUBSCRIPTION_FILE)
 token_store = StbTokenStore(STB_TOKEN_FILE)
 stb_discovery_service = StbDiscoveryService(logger, token_store)
 discovery_store = DiscoveryStore(DISCOVERY_FILE)
@@ -79,6 +88,36 @@ export_service = ExportService(OUTPUT_DIR)
 hls_service = HlsService(logger)
 epg_service = EpgService(logger, EPG_CACHE_FILE)
 iptv_auth_service = IptvAuthService(IPTV_AUTH_BACKUP_FILE, DATA_DIR, logger)
+
+
+def _with_local_epg_key(settings: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Inject the locally stored EPG key for an internal refresh only."""
+    merged = dict(settings if settings is not None else settings_store.load())
+    key = epg_key_store.get_epg_key()
+    if key:
+        merged["epg_des3_key"] = key
+    return merged
+
+
+def _public_settings(settings: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Return settings without emitting local recovery material."""
+    public = dict(settings if settings is not None else settings_store.load())
+    public["epg_des3_key"] = ""
+    public["epg_des3_key_configured"] = epg_key_store.has_epg_key()
+    return public
+
+
+def _migrate_legacy_epg_key() -> None:
+    """Move an old key out of settings.json without ever returning it by API."""
+    settings = settings_store.load()
+    legacy_key = str(settings.get("epg_des3_key") or "").strip()
+    if legacy_key and not epg_key_store.has_epg_key():
+        epg_key_store.set_epg_key(legacy_key)
+    if legacy_key:
+        settings_store.save({"epg_des3_key": ""})
+
+
+_migrate_legacy_epg_key()
 STARTED_AT = time.time()
 _snapshot_cache: dict[str, tuple[float, bytes]] = {}
 _snapshot_cache_ttl = 30
@@ -102,6 +141,92 @@ _catchup_auto_state: dict[str, Any] = {
     "token_expiry_note": "尚未刷新",
 }
 _catchup_auto_thread_started = False
+_CATCHUP_FFMPEG_START_TIMEOUT_SECONDS = 15
+_CATCHUP_FFMPEG_READ_TIMEOUT_MICROSECONDS = 15_000_000
+_STABLE_CHANNEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
+
+
+def _stop_catchup_ffmpeg(proc: subprocess.Popen[Any]) -> str:
+    """Stop a catchup FFmpeg process and return a redacted stderr excerpt."""
+    try:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+    except Exception:
+        pass
+    try:
+        return redact_sensitive_text(proc.stderr.read().decode(errors="replace").strip(), 400)
+    except Exception:
+        return ""
+
+
+def _wait_for_catchup_first_chunk(
+    proc: subprocess.Popen[Any], timeout_seconds: float = _CATCHUP_FFMPEG_START_TIMEOUT_SECONDS,
+) -> tuple[bytes, str]:
+    """Return the first MPEG-TS chunk, or a reason before HTTP streaming starts."""
+    deadline = time.monotonic() + timeout_seconds
+    stdout = proc.stdout
+    if stdout is None:
+        return b"", "FFmpeg 未创建输出管道"
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            return b"", "FFmpeg 在输出首帧前退出"
+        remaining = max(0.01, deadline - time.monotonic())
+        ready, _, _ = select.select([stdout], [], [], remaining)
+        if not ready:
+            break
+        chunk = os.read(stdout.fileno(), 65536)
+        if chunk:
+            return chunk, ""
+        if proc.poll() is not None:
+            return b"", "FFmpeg 在输出首帧前退出"
+    return b"", f"回看上游在 {int(timeout_seconds)} 秒内未返回数据"
+
+
+def _catchup_rtsp_candidates(backtv_url: str, playseek: str) -> list[tuple[str, str]]:
+    """Build safe RTSP playback candidates without exposing the saved URL."""
+    backtv = str(backtv_url or "").strip()
+    if not backtv:
+        return []
+    separator = "&" if "?" in backtv else "?"
+    candidates = [("captured", f"{backtv}{separator}playseek={playseek}")]
+    # Some Huawei/CU channel tables include stale query parameters after the
+    # ``.smil`` resource.  The compatible player flow starts from the bare
+    # resource and sends only the requested playback window.
+    smil_match = re.match(r"^(.+?\.smil)(?:[?#].*)?$", backtv, re.IGNORECASE)
+    if smil_match:
+        candidates.insert(0, ("canonical_smil", f"{smil_match.group(1)}?playseek={playseek}"))
+    unique: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for mode, url in candidates:
+        if url not in seen:
+            unique.append((mode, url))
+            seen.add(url)
+    return unique
+
+
+def _catchup_failure_category(stderr_text: str, start_error: str) -> str:
+    """Return a user-safe diagnostic category; never return FFmpeg text."""
+    text = f"{stderr_text}\n{start_error}".lower()
+    rules = (
+        ("rtsp_unauthorized", ("401", "unauthorized")),
+        ("rtsp_forbidden", ("403", "forbidden")),
+        ("rtsp_not_found", ("404", "not found")),
+        ("rtsp_connection_refused", ("connection refused",)),
+        ("rtsp_timeout", ("timed out", "connection timeout", "timeout")),
+        ("rtsp_transport_unsupported", ("461", "unsupported transport")),
+        ("rtsp_method_rejected", ("405", "455", "method not allowed", "method not valid")),
+        ("rtsp_protocol_incompatible", ("method", "protocol not found", "option not found")),
+        ("rtsp_invalid_media", ("invalid data", "could not find codec")),
+    )
+    for category, markers in rules:
+        if any(marker in text for marker in markers):
+            return category
+    return "rtsp_no_media"
 
 
 def _version_tuple(v: str) -> tuple[int, ...]:
@@ -411,6 +536,7 @@ def _export_health_check_one(
         _safe_int(item.get("fcc_port")),
         _safe_int(item.get("fec_port")),
         str(settings.get("fcc_type", "") or "").strip(),
+        str(settings.get("rtp2httpd_path_prefix", "") or "").strip(),
     )
     timeout = max(0.5, float(settings.get("export_health_timeout_seconds", EXPORT_HEALTH_TIMEOUT_SECONDS) or EXPORT_HEALTH_TIMEOUT_SECONDS))
     sample_bytes = max(188, int(settings.get("export_health_sample_bytes", EXPORT_HEALTH_SAMPLE_BYTES) or EXPORT_HEALTH_SAMPLE_BYTES))
@@ -795,7 +921,7 @@ def api_interfaces():
 
 @app.get("/api/settings")
 def api_settings_get():
-    return api_success(settings_store.load())
+    return api_success(_public_settings())
 
 
 @app.post("/api/settings")
@@ -803,8 +929,20 @@ def api_settings_save():
     data = request.get_json(silent=True) or {}
     if not isinstance(data, dict):
         return api_error("请求体格式不正确")
+    epg_key = str(data.pop("epg_des3_key", "") or "").strip()
+    clear_epg_key = bool(data.pop("clear_epg_des3_key", False))
+    data.pop("epg_des3_key_configured", None)
+    if epg_key:
+        epg_key_store.set_epg_key(epg_key)
+    elif clear_epg_key:
+        epg_key_store.clear_epg_key()
     if "fcc_type" in data and str(data.get("fcc_type") or "").strip() not in {"", "telecom", "huawei"}:
         data["fcc_type"] = ""
+    if "rtp2httpd_path_prefix" in data:
+        try:
+            data["rtp2httpd_path_prefix"] = ExportService.normalize_path_prefix(data.get("rtp2httpd_path_prefix"))
+        except ValueError as exc:
+            return api_error(str(exc), 400)
     saved = settings_store.save(data)
     epg_url = str(saved.get("epg_url", "")).strip()
     logo_url = str(saved.get("logo_url", "")).strip()
@@ -820,7 +958,7 @@ def api_settings_save():
         ):
             epg_service.refresh_async(epg_url, logo_url if saved.get("use_logo", True) else "")
     logger.info("已保存网页默认设置")
-    return api_success(saved)
+    return api_success(_public_settings(saved))
 
 
 @app.get("/api/status")
@@ -848,9 +986,296 @@ def api_streams():
     return api_error("UDP 流发现功能已移除，请使用运营商频道发现导入频道", 410)
 
 
+def _valid_stable_channel_id(value: str) -> str:
+    text = str(value or "").strip()
+    return text if _STABLE_CHANNEL_ID_RE.fullmatch(text) else ""
+
+
+def _stable_channel_id(row: dict[str, Any], operator: dict[str, Any] | None = None) -> str:
+    """Choose a durable, URL-safe identity without exposing source addresses.
+
+    An operator ChannelID survives multicast/FCC changes, so it takes priority.
+    Locally saved IDs preserve the fallback identity for non-operator imports.
+    """
+    operator = operator or {}
+    channel_id = str(operator.get("channel_id") or row.get("channel_id") or "").strip()
+    if channel_id:
+        normalized = re.sub(r"[^A-Za-z0-9._-]+", "-", channel_id).strip(".-")
+        candidate = _valid_stable_channel_id(f"c-{normalized}")
+        if candidate:
+            return candidate
+    saved = _valid_stable_channel_id(row.get("stable_id", ""))
+    if saved:
+        return saved
+    # A saved source keeps its generated identity when metadata is later edited.
+    fingerprint = "|".join([
+        str(row.get("tvg_id") or "").strip(),
+        normalize_channel_name(str(row.get("name") or "").strip()),
+        str(row.get("key") or "").strip(),
+    ])
+    digest = hashlib.sha1(fingerprint.encode("utf-8", errors="ignore")).hexdigest()[:16]
+    return f"m-{digest}"
+
+
+def _stable_channel_catalog() -> dict[str, dict[str, Any]]:
+    """Return current channel mappings keyed by durable public IDs.
+
+    When an operator table is available it is authoritative for the active
+    multicast endpoint.  Old channel-store entries are intentionally excluded,
+    so a re-import cannot leave a stable URL pointing at a stale source.
+    """
+    stored = channel_store.load()
+    operator_channels = operator_channel_store.load()
+    candidates: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    if operator_channels:
+        for key, operator in operator_channels.items():
+            if not isinstance(operator, dict):
+                continue
+            host = str(operator.get("host") or "").strip()
+            try:
+                port = int(operator.get("port"))
+            except (TypeError, ValueError):
+                continue
+            if not valid_ipv4_multicast(host) or not 1 <= port <= 65535:
+                continue
+            row = dict(stored.get(key) or {})
+            row.update({"key": key, "host": host, "port": port})
+            for field in ("fcc_ip", "fcc_port", "fec_port", "operator_group", "is_hd"):
+                if operator.get(field) not in (None, "", 0, False):
+                    row[field] = operator.get(field)
+            if not str(row.get("name") or "").strip():
+                row["name"] = str(operator.get("name") or "").strip()
+            if not str(row.get("category") or "").strip():
+                row["category"] = str(operator.get("category") or "").strip() or "其它频道"
+            candidates.append((row, operator))
+    else:
+        candidates = [(dict(row), {}) for row in stored.values() if isinstance(row, dict)]
+
+    catalog: dict[str, dict[str, Any]] = {}
+    for row, operator in candidates:
+        row = fill_channel_name_from_metadata(row, allow_epg_name=False)
+        if not str(row.get("name") or "").strip():
+            continue
+        stable_id = _stable_channel_id(row, operator)
+        if stable_id in catalog:
+            suffix = hashlib.sha1(str(row.get("key") or "").encode("utf-8")).hexdigest()[:8]
+            stable_id = f"{stable_id}-{suffix}"
+        row["stable_id"] = stable_id
+        catalog[stable_id] = {"row": row, "operator": operator}
+    return catalog
+
+
+def _default_subscription_ids(catalog: dict[str, dict[str, Any]]) -> list[str]:
+    """Choose the existing best-source view when migrating pre-1.3 installs."""
+    records = list(catalog.values())
+    normalized = export_service._normalize_channels([item["row"] for item in records])
+    selected_keys = {channel.key for channel in export_service._select_best_channels(normalized)}
+    return [
+        stable_id for stable_id, item in catalog.items()
+        if str(item["row"].get("key") or "") in selected_keys
+    ]
+
+
+def _subscription_candidate_ids(catalog: dict[str, dict[str, Any]]) -> list[str]:
+    """Return persisted candidates, migrating older installations once."""
+    saved = subscription_store.load()
+    if not saved["initialized"]:
+        saved = subscription_store.save(_default_subscription_ids(catalog))
+    available = set(catalog)
+    return [stable_id for stable_id in saved["candidate_ids"] if stable_id in available]
+
+
+def _subscription_entry(stable_id: str, item: dict[str, Any]) -> dict[str, Any]:
+    row = item["row"]
+    operator = item["operator"]
+    return {
+        "stable_id": stable_id,
+        "name": str(row.get("name") or ""),
+        "category": str(row.get("category") or "其它频道"),
+        "is_hd": bool(row.get("is_hd")),
+        "has_catchup": bool(str(operator.get("backtv_url") or "").strip()),
+        "has_fcc": bool(str(row.get("fcc_ip") or "").strip() and row.get("fcc_port")),
+        "source_count": 1,
+    }
+
+
+def _subscription_m3u(include_all: bool = False, hls_compat: bool = False) -> str:
+    """Build a fast, state-only subscription; never run health checks here."""
+    settings = settings_store.load()
+    catalog = _stable_channel_catalog()
+    candidate_ids = _subscription_candidate_ids(catalog)
+    records = [catalog[stable_id] for stable_id in candidate_ids]
+    # The active catalog already keeps one current source per durable channel
+    # ID.  "全部" is retained as a stable public endpoint for clients that
+    # need it; it contains every selected logical channel rather than bypassing
+    # the owner's candidate list.
+    records.sort(key=lambda item: natural_key(str(item["row"].get("name") or "")))
+
+    base_url = request.url_root.rstrip("/")
+    epg_url = str(settings.get("epg_url") or "").strip() if settings.get("use_epg", True) else ""
+    catchup_enabled = bool(settings.get("catchup_enabled")) and int(settings.get("catchup_days") or 0) > 0
+    lines = [f'#EXTM3U x-tvg-url="{base_url}/epg.xml"' if epg_url else "#EXTM3U"]
+    if catchup_enabled:
+        lines[0] += ' catchup-correction="8"'
+    for item in records:
+        row = item["row"]
+        operator = item["operator"]
+        stable_id = row["stable_id"]
+        tvg_id = str(row.get("tvg_id") or row.get("tvg_name") or row.get("name") or "").replace('"', "'")
+        tvg_name = str(row.get("tvg_name") or row.get("name") or "").replace('"', "'")
+        group = str(row.get("category") or "其它频道").replace('"', "'")
+        logo = str(row.get("tvg_logo") or "").replace('"', "%22")
+        logo_attr = f' tvg-logo="{logo}"' if logo else ""
+        catchup_attr = ""
+        backtv = str(operator.get("backtv_url") or "").strip()
+        if catchup_enabled and backtv:
+            raw_days = operator.get("time_shift_days") or 0
+            try:
+                days = max(1, int(raw_days) // 1440) if raw_days else int(settings.get("catchup_days") or 7)
+            except (TypeError, ValueError):
+                days = int(settings.get("catchup_days") or 7)
+            catchup_source = f"{base_url}/catchup/{stable_id}?playseek=${{(b)yyyyMMddHHmmss:utc}}-${{(e)yyyyMMddHHmmss:utc}}"
+            catchup_attr = f' catchup="default" catchup-days="{days}" catchup-source="{catchup_source}"'
+        lines.append(f'#EXTINF:-1 tvg-id="{tvg_id}" tvg-name="{tvg_name}"{logo_attr} group-title="{group}"{catchup_attr},{row["name"]}')
+        suffix = "?format=hls" if hls_compat else ""
+        lines.append(f"{base_url}/live/{stable_id}{suffix}")
+    return "\n".join(lines) + "\n"
+
+
+def _subscription_response(include_all: bool = False, hls_compat: bool = False) -> Response:
+    response = Response(_subscription_m3u(include_all, hls_compat), mimetype="audio/x-mpegurl")
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    return response
+
+
+@app.get("/playlist.m3u")
+def playlist_best_subscription():
+    return _subscription_response()
+
+
+@app.get("/playlist-all.m3u")
+def playlist_all_subscription():
+    return _subscription_response(include_all=True)
+
+
+@app.get("/playlist-hls.m3u")
+def playlist_hls_subscription():
+    return _subscription_response(hls_compat=True)
+
+
+@app.get("/epg.xml")
+def epg_subscription():
+    settings = settings_store.load()
+    source = str(settings.get("epg_url") or "").strip() if settings.get("use_epg", True) else ""
+    if not source:
+        return api_error("未配置 EPG 订阅源", 404)
+    response = redirect(source, code=307)
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    return response
+
+
+@app.get("/live/<stable_id>")
+def stable_live(stable_id: str):
+    entry = _stable_channel_catalog().get(_valid_stable_channel_id(stable_id))
+    if not entry:
+        return api_error("频道不存在或已移除", 404)
+    row = entry["row"]
+    settings = settings_store.load()
+    if str(request.args.get("format") or "").strip().lower() == "hls":
+        target = f"{request.url_root.rstrip('/')}/hls/{row['host']}_{row['port']}/stream.m3u8"
+    else:
+        http_host = str(settings.get("http_host") or "").strip()
+        if not http_host:
+            return api_error("未配置 rtp2httpd 地址", 503)
+        target = ExportService.make_http_url(
+            http_host,
+            int(settings.get("http_port") or 5140),
+            str(settings.get("path_mode") or "rtp"),
+            str(row["host"]),
+            int(row["port"]),
+            str(row.get("fcc_ip") or ""),
+            row.get("fcc_port"),
+            row.get("fec_port"),
+            str(settings.get("fcc_type") or ""),
+            str(settings.get("rtp2httpd_path_prefix") or ""),
+        )
+    response = redirect(target, code=307)
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    return response
+
+
+@app.get("/catchup/<stable_id>")
+def stable_catchup(stable_id: str):
+    entry = _stable_channel_catalog().get(_valid_stable_channel_id(stable_id))
+    if not entry:
+        return api_error("频道不存在或已移除", 404)
+    row = entry["row"]
+    # Reuse the proven RTSP compatibility path; only the public lookup key is
+    # stable.  The current multicast key remains an internal implementation detail.
+    return hls_catchup(f"{row['host']}_{row['port']}")
+
+
+@app.get("/api/subscription")
+def api_subscription():
+    catalog = _stable_channel_catalog()
+    candidate_ids = _subscription_candidate_ids(catalog)
+    candidates = [_subscription_entry(stable_id, catalog[stable_id]) for stable_id in candidate_ids]
+    return api_success({
+        "candidates": candidates,
+        "candidate_ids": candidate_ids,
+        "total_candidates": len(candidates),
+        "available_candidates": len(candidates),
+        "catchup_candidates": sum(1 for item in candidates if item["has_catchup"]),
+        "fcc_candidates": sum(1 for item in candidates if item["has_fcc"]),
+        "urls": {
+            "best": "/playlist.m3u",
+            "all": "/playlist-all.m3u",
+            "hls": "/playlist-hls.m3u",
+            "epg": "/epg.xml",
+        },
+    })
+
+
+@app.post("/api/subscription/candidates")
+def api_subscription_candidates():
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return api_error("请求体格式不正确")
+    action = str(data.get("action") or "").strip()
+    requested = data.get("stable_ids") or []
+    if action not in {"add", "remove", "replace", "reset_to_best"}:
+        return api_error("action 必须为 add、remove、replace 或 reset_to_best")
+    if not isinstance(requested, list):
+        return api_error("stable_ids 必须是数组")
+    catalog = _stable_channel_catalog()
+    current = _subscription_candidate_ids(catalog)
+    valid_requested = [str(item).strip() for item in requested if str(item).strip() in catalog]
+    if action == "reset_to_best":
+        updated = _default_subscription_ids(catalog)
+    elif action == "replace":
+        updated = valid_requested
+    elif action == "add":
+        updated = current + [item for item in valid_requested if item not in current]
+    else:
+        remove = set(valid_requested)
+        updated = [item for item in current if item not in remove]
+    subscription_store.save(updated)
+    logger.info(f"订阅候选清单已更新：{action}，当前 {len(updated)} 个频道")
+    return api_subscription()
+
+
 @app.get("/api/channels")
 def api_channels():
     rows = display_channel_rows(channel_store.list())
+    catalog = _stable_channel_catalog()
+    candidate_ids = set(_subscription_candidate_ids(catalog))
+    stable_by_key = {str(item["row"].get("key") or ""): stable_id for stable_id, item in catalog.items()}
+    for row in rows:
+        stable_id = stable_by_key.get(str(row.get("key") or "")) or _stable_channel_id(row)
+        row["stable_id"] = stable_id
+        row["subscription_candidate"] = stable_id in candidate_ids
+        row["has_catchup"] = bool(catalog.get(stable_id, {}).get("operator", {}).get("backtv_url"))
+        row["has_fcc"] = bool(str(row.get("fcc_ip") or "").strip() and row.get("fcc_port"))
     seen = {cat: None for cat in CATEGORY_OPTIONS}
     for row in rows:
         cat = str(row.get("category") or "").strip()
@@ -967,6 +1392,7 @@ def _do_operator_import(channels: list[dict]) -> dict:
         stored = existing.get(key, {})
         rows.append({
             "key": key,
+            "stable_id": f"c-{str(ch.get('channel_id') or '').strip()}" if str(ch.get("channel_id") or "").strip() else "",
             "host": ch["ip"],
             "port": ch["port"],
             "name": ch.get("name", ""),
@@ -1061,7 +1487,7 @@ def _global_backup_response(selected: list[str] | None = None) -> Response:
         if key not in selected_keys:
             continue
         if key == "settings":
-            payload[key] = settings_store.load()
+            payload[key] = _public_settings()
             continue
         try:
             payload[key] = json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
@@ -1171,6 +1597,12 @@ def api_backup_import():
             skipped.append(key)
             continue
         try:
+            if key == "settings" and isinstance(value, dict):
+                value = dict(value)
+                legacy_key = str(value.pop("epg_des3_key", "") or "").strip()
+                value.pop("epg_des3_key_configured", None)
+                if legacy_key:
+                    epg_key_store.set_epg_key(legacy_key)
             path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
             restored.append(key)
         except Exception as exc:
@@ -1197,6 +1629,8 @@ def api_backup_clear_all():
             cleared.append(key)
         except Exception as exc:
             logger.warning(f"清除配置失败：{key}: {exc}")
+    epg_key_store.clear_epg_key()
+    cleared.append("epg_local_key")
     operator_channel_store.invalidate()
     logger.info(f"本地配置已清除：{', '.join(cleared) or '无'}")
     return api_success({"cleared": cleared, "confirm_text": _CLEAR_ALL_CONFIRM_TEXT})
@@ -1265,6 +1699,7 @@ def api_stb_discovery_start():
     data = request.get_json(silent=True) or {}
     stb_ip = str(data.get("stb_ip", "")).strip()
     interface = str(data.get("interface", "any")).strip() or "any"
+    full_capture = bool(data.get("full_capture"))
     if not stb_ip:
         return api_error("请填写机顶盒 IP 地址")
     if not valid_ip_or_host(stb_ip):
@@ -1273,7 +1708,7 @@ def api_stb_discovery_start():
     if not rt["ok"]:
         return api_error("；".join(rt["errors"]), 500)
     try:
-        stb_discovery_service.start(stb_ip, interface)
+        stb_discovery_service.start(stb_ip, interface, full_capture=full_capture)
         return api_success(stb_discovery_service.status())
     except RuntimeError as exc:
         return api_error(str(exc))
@@ -1292,6 +1727,25 @@ def api_stb_discovery_stop():
         return api_error(str(exc), 500)
 
 
+@app.post("/api/stb_discovery/reanalyze")
+def api_stb_discovery_reanalyze():
+    """Reparse the latest persisted PCAP without starting a new capture."""
+    data = request.get_json(silent=True) or {}
+    auth = token_store.load_auth_info()
+    stb_ip = str(data.get("stb_ip") or auth.get("assigned_ip") or "").strip()
+    if not stb_ip:
+        return api_error("未找到机顶盒 IP，请提供 stb_ip 或先恢复机顶盒认证资料")
+    if not valid_ip_or_host(stb_ip):
+        return api_error("IP 地址格式不正确")
+    try:
+        return api_success(stb_discovery_service.reanalyze_latest_archive(stb_ip))
+    except RuntimeError as exc:
+        return api_error(str(exc), 400)
+    except Exception as exc:
+        logger.error(f"离线重解析 STB 抓包失败：{exc}")
+        return api_error(str(exc), 500)
+
+
 @app.post("/api/stb_discovery/reset")
 def api_stb_discovery_reset():
     stb_discovery_service.reset()
@@ -1300,12 +1754,63 @@ def api_stb_discovery_reset():
 
 @app.get("/api/stb_discovery/pcap")
 def api_stb_discovery_pcap():
-    path = stb_discovery_service.pcap_path()
+    archive_name = str(request.args.get("archive") or "").strip()
+    if archive_name:
+        archived = stb_discovery_service.archive_path(archive_name)
+        path = str(archived) if archived else ""
+    else:
+        path = stb_discovery_service.pcap_path()
+    if not path and not archive_name:
+        archived = stb_discovery_service.latest_archive_path()
+        path = str(archived) if archived else ""
     if not path:
         return api_error("暂无可导出的 STB 抓包文件，请先完成一次 STB 开机捕获", 404)
     stopped_at = int(stb_discovery_service.status().get("stopped_at") or time.time())
-    filename = time.strftime("stb-boot-%Y%m%d-%H%M%S.pcap", time.localtime(stopped_at))
-    return send_file(path, as_attachment=True, download_name=filename, mimetype="application/vnd.tcpdump.pcap")
+    filename = Path(path).name or time.strftime("stb-boot-%Y%m%d-%H%M%S.pcap", time.localtime(stopped_at))
+    return send_file(
+        path,
+        as_attachment=True,
+        download_name=filename,
+        mimetype="application/vnd.tcpdump.pcap",
+        max_age=0,
+    )
+
+
+@app.get("/api/stb_discovery/archives")
+def api_stb_discovery_archives():
+    return api_success({"archives": stb_discovery_service.list_archives()})
+
+
+@app.get("/api/stb_discovery/archive-backup")
+def api_stb_discovery_archive_backup():
+    """Export a persisted raw PCAP as a portable local backup ZIP."""
+    archive_name = str(request.args.get("archive") or "").strip()
+    pcap_path = (
+        stb_discovery_service.archive_path(archive_name)
+        if archive_name else stb_discovery_service.latest_archive_path()
+    )
+    if not pcap_path:
+        return api_error("暂无已归档的 STB 抓包文件", 404)
+    archive_dir = pcap_path.parent
+    manifest_path = archive_dir / f"{pcap_path.stem}.artifacts" / "manifest.json"
+    bundle = io.BytesIO()
+    with zipfile.ZipFile(bundle, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.write(pcap_path, arcname=f"raw/{pcap_path.name}")
+        if manifest_path.is_file():
+            zf.write(manifest_path, arcname=f"metadata/{pcap_path.stem}.manifest.json")
+        zf.writestr(
+            "README.txt",
+            "This archive contains a raw local STB PCAP. It may include IPTV authentication material. "
+            "Store it privately and restore it only to a trusted local IPTV Sniffer Web deployment.\n",
+        )
+    bundle.seek(0)
+    return send_file(
+        bundle,
+        as_attachment=True,
+        download_name=f"{pcap_path.stem}-backup.zip",
+        mimetype="application/zip",
+        max_age=0,
+    )
 
 
 @app.post("/api/stb_discovery/import")
@@ -1313,10 +1818,15 @@ def api_stb_discovery_import():
     """Import channels discovered from the last STB boot capture."""
     state = stb_discovery_service.status()
     channels = state.get("channels") or []
-    if not channels:
-        return api_error("没有可导入的频道，请先完成 STB 开机捕获")
+    epg_creds = state.get("epg_creds") or {}
+    if not channels and not epg_creds:
+        return api_error("没有可导入的频道或认证资料，请先完成 STB 开机捕获")
     try:
-        result = _do_operator_import(channels)
+        result = _do_operator_import(channels) if channels else {
+            "imported": 0,
+            "fcc_saved": 0,
+            "channels_saved": 0,
+        }
         current = settings_store.load()
         # Auto-populate timeshift_host if detected and not yet configured
         timeshift_host = str(state.get("timeshift_host") or "").strip()
@@ -1325,7 +1835,6 @@ def api_stb_discovery_import():
             result["timeshift_host_detected"] = timeshift_host
             logger.info(f"自动检测到回看服务器地址：{timeshift_host}")
         # Auto-populate EPG credentials extracted from pcap (never overwrite existing values)
-        epg_creds = state.get("epg_creds") or {}
         epg_updates: dict[str, str] = {}
         epg_key_map = {
             "epg_user_id": "epg_user_id",
@@ -1335,6 +1844,9 @@ def api_stb_discovery_import():
             "epg_stb_type": "epg_stb_type",
             "epg_stb_version": "epg_stb_version",
             "access_user_name": "epg_access_user_name",
+            "epg_net_user_id": "epg_net_user_id",
+            "epg_conn_type": "epg_conn_type",
+            "epg_lang": "epg_lang",
         }
         for src_key, dst_key in epg_key_map.items():
             val = str(epg_creds.get(src_key) or "").strip()
@@ -1343,7 +1855,10 @@ def api_stb_discovery_import():
         if epg_updates:
             settings_store.save(epg_updates)
             result["epg_creds_detected"] = epg_updates
-            logger.info(f"从抓包自动提取 EPG 认证信息：{epg_updates}")
+            logger.info(
+                "从抓包自动提取 EPG 认证字段："
+                + "、".join(sorted(epg_updates))
+            )
         portal_auth = state.get("portal_auth") or {}
         if portal_auth:
             result["portal_auth_detected"] = {
@@ -1566,48 +2081,113 @@ def hls_catchup(hls_key: str):
     backtv = str(ch_info.get("backtv_url", "") or "").strip()
     if not backtv:
         return api_error("该频道无回看地址", 404)
-    if shutil.which("ffmpeg") is None:
-        return api_error("缺少 ffmpeg 命令，无法转换回看流", 503)
-    sep = "&" if "?" in backtv else "?"
-    rtsp_url = f"{backtv}{sep}playseek={playseek}"
-
-    def generate():
-        proc = subprocess.Popen(
-            [
-                "ffmpeg", "-rtsp_transport", "tcp",
-                "-i", rtsp_url,
-                "-c", "copy", "-f", "mpegts", "pipe:1",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
+    settings = settings_store.load()
+    user_agent = str(settings.get("epg_user_agent") or "").strip()
+    last_start_error = "回看上游未返回媒体数据"
+    last_diagnostic = "rtsp_no_media"
+    # HWCU's media server requires the STB's four MP2T transport alternatives
+    # in one SETUP request plus a dynamic X-NAT_ADDRESS. FFmpeg emits separate
+    # SETUP requests even for ``udp+tcp`` and receives 461. Try the compatible
+    # control flow first, while retaining FFmpeg for other operator profiles.
+    for url_mode, rtsp_url in _catchup_rtsp_candidates(backtv, playseek):
+        session = CombinedRtspUdpSession(rtsp_url, user_agent)
         try:
-            while True:
-                chunk = proc.stdout.read(65536)
-                if not chunk:
-                    break
-                yield chunk
-        finally:
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-            stderr_out = proc.stderr.read().decode(errors="replace").strip()
-            if stderr_out:
-                logger.warning(f"catchup ffmpeg [{hls_key}]: {redact_sensitive_text(stderr_out, 400)}")
+            first_chunk = session.open()
+        except RtspCatchupError as exc:
+            last_diagnostic = exc.category
+            logger.warning(
+                f"catchup combined-rtsp [{hls_key}] mode={url_mode} diagnostic={last_diagnostic}"
+            )
+            continue
+        resp = Response(session.iter_payloads(first_chunk), mimetype="video/mp2t")
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Cache-Control"] = "no-cache"
+        return resp
 
-    resp = Response(generate(), mimetype="video/mp2t")
-    resp.headers["Access-Control-Allow-Origin"] = "*"
-    resp.headers["Cache-Control"] = "no-cache"
-    return resp
+    if shutil.which("ffmpeg") is None:
+        return api_error("缺少 ffmpeg 命令，无法转换回看流", 503, catchup_diagnostic=last_diagnostic)
+    for url_mode, rtsp_url in _catchup_rtsp_candidates(backtv, playseek):
+        # The captured STB SETUP advertises both UDP client ports and TCP
+        # interleaving.  Offer the same combination first; forcing either
+        # transport alone makes this platform return 461.  Keep FFmpeg's
+        # default and single-transport modes as compatibility fallbacks.
+        for transport in ("udp+tcp", "auto", "tcp", "udp"):
+            ffmpeg_command = [
+                "ffmpeg", "-rw_timeout", str(_CATCHUP_FFMPEG_READ_TIMEOUT_MICROSECONDS),
+            ]
+            # EPG authentication already uses the STB's captured User-Agent. Reuse
+            # it for the subsequent RTSP request as some media servers apply the
+            # same terminal-profile check to the playback connection.
+            if user_agent:
+                ffmpeg_command.extend(["-user_agent", user_agent])
+            if transport != "auto":
+                ffmpeg_command.extend(["-rtsp_transport", transport])
+            ffmpeg_command.extend(["-i", rtsp_url, "-c", "copy", "-f", "mpegts", "pipe:1"])
+            proc = subprocess.Popen(
+                ffmpeg_command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            first_chunk, start_error = _wait_for_catchup_first_chunk(proc)
+            if not start_error:
+                def generate():
+                    try:
+                        yield first_chunk
+                        while True:
+                            chunk = proc.stdout.read(65536)
+                            if not chunk:
+                                break
+                            yield chunk
+                    finally:
+                        _stop_catchup_ffmpeg(proc)
+
+                resp = Response(generate(), mimetype="video/mp2t")
+                resp.headers["Access-Control-Allow-Origin"] = "*"
+                resp.headers["Cache-Control"] = "no-cache"
+                return resp
+
+            stderr_out = _stop_catchup_ffmpeg(proc)
+            last_start_error = start_error
+            last_diagnostic = _catchup_failure_category(stderr_out, start_error)
+            logger.warning(
+                f"catchup ffmpeg [{hls_key}] mode={url_mode} transport={transport} "
+                f"diagnostic={last_diagnostic}"
+            )
+            if last_diagnostic == "rtsp_transport_unsupported" and transport != "udp":
+                continue
+            break
+
+    return api_error(last_start_error, 504, catchup_diagnostic=last_diagnostic)
+
+
+def _merged_stb_auth_info() -> dict[str, Any]:
+    """Overlay non-empty live capture fields on the persisted STB identity."""
+    persisted = token_store.load_auth_info()
+    live = stb_discovery_service.status().get("auth_info") or {}
+    merged = dict(persisted) if isinstance(persisted, dict) else {}
+    if isinstance(live, dict):
+        merged.update({key: value for key, value in live.items() if value not in (None, "", [], {})})
+    return merged
 
 
 def _effective_stb_auth_info() -> dict[str, Any]:
-    auth = stb_discovery_service.status().get("auth_info") or {}
-    if auth.get("mac") or auth.get("assigned_ip"):
-        return auth
-    return token_store.load_auth_info()
+    auth_info = _merged_stb_auth_info()
+    # HWCU includes an IPTV-side address in its Authenticator.  A persisted
+    # STB boot capture is valuable for the terminal identity, but its old
+    # lease can no longer represent the current 8788 test client.  Prefer the
+    # active authenticated interface address whenever it is available.
+    interface = str(settings_store.load().get("interface") or "").strip()
+    if interface:
+        try:
+            snapshot = iptv_auth_service.snapshot(interface)
+            for item in snapshot.get("ipv4") or []:
+                current_ip = str(item.get("local") or "").strip()
+                if current_ip.startswith("10."):
+                    auth_info["assigned_ip"] = current_ip
+                    break
+        except Exception:
+            pass
+    return auth_info
 
 
 def _catchup_refresh_interval_hours(settings: dict[str, Any]) -> int:
@@ -1650,6 +2230,7 @@ def _catchup_refresh_status(settings: dict[str, Any] | None = None) -> dict[str,
 
 
 def _refresh_backtv_with_state(settings: dict[str, Any], source: str) -> dict[str, Any]:
+    settings = _with_local_epg_key(settings)
     now = int(time.time())
     with _catchup_refresh_lock:
         if _catchup_auto_state.get("running"):
@@ -1662,8 +2243,6 @@ def _refresh_backtv_with_state(settings: dict[str, Any], source: str) -> dict[st
 
     try:
         op_channels = operator_channel_store.load()
-        if not op_channels:
-            raise ValueError("运营商频道表为空，请先完成 STB 开机捕获并导入频道")
         result = refresh_backtv_urls(settings, op_channels, _effective_stb_auth_info(), logger)
         operator_channel_store.save_dict(op_channels)
         finished_at = int(time.time())
@@ -1731,9 +2310,13 @@ def _start_catchup_auto_refresh_loop() -> None:
 @app.post("/api/catchup/refresh")
 def api_catchup_refresh():
     """Re-authenticate to EPG portal and refresh backtv_url tokens in operator_channels.json."""
-    settings = settings_store.load()
+    settings = _with_local_epg_key()
     # Allow caller to supply credentials directly (so user needn't save first)
     override = request.get_json(silent=True) or {}
+    override_key = str(override.get("epg_des3_key") or "").strip() if isinstance(override, dict) else ""
+    if override_key:
+        epg_key_store.set_epg_key(override_key)
+        settings["epg_des3_key"] = override_key
     for key in (
         "iptv_password",
         "epg_user_id",
@@ -1747,6 +2330,9 @@ def api_catchup_refresh():
         "epg_stb_version",
         "epg_user_agent",
         "epg_access_user_name",
+        "epg_net_user_id",
+        "epg_conn_type",
+        "epg_lang",
     ):
         if override.get(key):
             settings[key] = override[key]
@@ -1923,11 +2509,9 @@ def api_channels_set_primary():
 @app.get("/api/stb-summary")
 def api_stb_summary():
     """Compact summary of STB auth/channel state for the top status bar."""
-    auth = stb_discovery_service.status().get("auth_info") or {}
-    if auth.get("mac") or auth.get("assigned_ip"):
+    auth = _merged_stb_auth_info()
+    if auth:
         token_store.save_auth_info(auth)
-    else:
-        auth = token_store.load_auth_info()
     token_data = token_store.load()
     has_token = bool((token_data.get("history") or []))
     fcc_count = len(fcc_store.load())
@@ -1945,7 +2529,11 @@ def api_stb_summary():
 
 
 def _latest_stb_auth_info() -> dict[str, Any]:
-    return stb_discovery_service.status().get("auth_info") or {}
+    # After a backup restore or service restart, the in-memory discovery
+    # state is empty while playlist_token.json still has the captured DHCP
+    # identity.  IPTV authentication must use that persisted record rather
+    # than forcing another STB boot capture.
+    return _merged_stb_auth_info()
 
 
 @app.get("/api/iptv-auth/status")
@@ -1963,7 +2551,17 @@ def api_iptv_auth_status():
 def api_iptv_auth_apply():
     data = request.get_json(silent=True) or {}
     try:
-        return api_success(iptv_auth_service.apply(data, _latest_stb_auth_info()))
+        result = iptv_auth_service.apply(data, _latest_stb_auth_info())
+        # Keep the successfully authenticated interface as the active IPTV
+        # interface.  HWCU refresh then uses its current lease address rather
+        # than falling back to the address in the historical STB capture.
+        interface = str(result.get("interface") or "").strip()
+        if interface:
+            settings = settings_store.load()
+            if settings.get("interface") != interface:
+                settings["interface"] = interface
+                settings_store.save(settings)
+        return api_success(result)
     except Exception as exc:
         logger.error(f"实验性 IPTV 认证执行失败：{exc}")
         return api_error(str(exc))
@@ -2110,6 +2708,7 @@ def _load_rtp2httpd_config(path_hint: str) -> dict[str, Any]:
                 "external_m3u": values.get("external-m3u", ""),
                 "status_page_path": values.get("status-page-path", "/status"),
                 "player_page_path": values.get("player-page-path", "/player"),
+                "app_path_prefix": values.get("app-path-prefix", ""),
                 "bind": parsed["bind"],
             }
         except Exception as exc:
@@ -2157,8 +2756,13 @@ def api_diagnose():
     # --- Check 1: rtp2httpd reachability ---
     rtp2httpd_ok = False
     if http_host:
-        url = f"http://{http_host}:{http_port}/"
         cfg = _load_rtp2httpd_config(config_path)
+        path_prefix = str(data.get("path_prefix") or settings.get("rtp2httpd_path_prefix") or cfg.get("app_path_prefix") or "").strip()
+        try:
+            path_prefix = ExportService.normalize_path_prefix(path_prefix)
+        except ValueError:
+            path_prefix = ""
+        url = f"http://{http_host}:{http_port}{path_prefix}/status"
         try:
             req = Request(url)
             req.add_header("User-Agent", "IPTV-Sniffer-Web-Diag/1.0")
@@ -2174,7 +2778,7 @@ def api_diagnose():
         status_path = cfg.get("status_page_path") if cfg.get("ok") is True else "/status"
         if not str(status_path or "").startswith("/"):
             status_path = "/" + str(status_path)
-        status_url = f"http://{http_host}:{http_port}{status_path or '/status'}"
+        status_url = f"http://{http_host}:{http_port}{path_prefix}{status_path or '/status'}"
         try:
             req = Request(status_url)
             req.add_header("User-Agent", "IPTV-Sniffer-Web-Diag/1.0")

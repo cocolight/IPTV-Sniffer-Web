@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -28,8 +29,10 @@ class ExportService:
         fcc_port: int | None = None,
         fec_port: int | None = None,
         fcc_type: str = "",
+        path_prefix: str = "",
     ) -> str:
-        url = f"http://{http_host}:{http_port}/{path_mode}/{host}:{port}"
+        prefix = ExportService.normalize_path_prefix(path_prefix)
+        url = f"http://{http_host}:{http_port}{prefix}/{path_mode}/{host}:{port}"
         params: list[str] = []
         if fcc_ip and fcc_port:
             params.append(f"fcc={fcc_ip}:{int(fcc_port)}")
@@ -40,6 +43,18 @@ class ExportService:
         if params:
             url += "?" + "&".join(params)
         return url
+
+    @staticmethod
+    def normalize_path_prefix(value: str) -> str:
+        text = str(value or "").strip()
+        if not text or text == "/":
+            return ""
+        if not text.startswith("/"):
+            text = "/" + text
+        text = text.rstrip("/")
+        if not re.fullmatch(r"/[A-Za-z0-9._~/-]+", text) or ".." in text.split("/"):
+            raise ValueError("rtp2httpd 路径前缀不合法")
+        return text
 
     @staticmethod
     def make_source_url(
@@ -153,6 +168,7 @@ class ExportService:
             raise ValueError("没有填写任何频道名称，未生成输出文件")
         http_host = str(settings.get("http_host", "")).strip()
         http_port = int(settings.get("http_port", 5140))
+        path_prefix = self.normalize_path_prefix(settings.get("rtp2httpd_path_prefix", ""))
         path_mode = str(settings.get("path_mode", "rtp")).strip().lower()
         if path_mode not in {"rtp", "udp"}:
             path_mode = "rtp"
@@ -173,7 +189,7 @@ class ExportService:
         m3u_kwargs = dict(http_host=http_host, http_port=http_port, path_mode=path_mode,
                           epg_url=epg_url, catchup_days=catchup_days,
                           catchup_template=catchup_template, op_ch=op_ch, fcc_type=fcc_type,
-                          flask_base_url=flask_base_url)
+                          flask_base_url=flask_base_url, path_prefix=path_prefix)
         # New canonical files
         best_m3u_path  = self.output_dir / "channels-best.m3u"
         all_m3u_path   = self.output_dir / "channels-all.m3u"
@@ -194,8 +210,8 @@ class ExportService:
         _shutil.copy2(best_m3u_path, direct_m3u_path)
         _shutil.copy2(rtp_best_path, source_m3u_path)
         self._write_playlist_json(channels, json_path, path_mode, fcc_type=fcc_type)
-        self._write_txt(channels, txt_path, http_host, http_port, path_mode, fcc_type=fcc_type)
-        self._write_csv(channels, csv_path, http_host, http_port, path_mode, fcc_type=fcc_type)
+        self._write_txt(channels, txt_path, http_host, http_port, path_mode, fcc_type=fcc_type, path_prefix=path_prefix)
+        self._write_csv(channels, csv_path, http_host, http_port, path_mode, fcc_type=fcc_type, path_prefix=path_prefix)
         return {
             "count": len(channels),
             "best_count": len(best_channels),
@@ -246,6 +262,7 @@ class ExportService:
         fcc_type: str = "",
         op_ch: dict[str, Any] | None = None,
         flask_base_url: str = "",
+        path_prefix: str = "",
     ) -> None:
         # Each source is written exactly once, grouped by its original category.
         op_ch = op_ch or {}
@@ -259,7 +276,7 @@ class ExportService:
             else:
                 handle.write(f"#EXTM3U{catchup_attr}\n")
             for channel in channels:
-                self._write_m3u_item(handle, channel, channel.category, http_host, http_port, path_mode, url_mode, catchup_days, catchup_template, op_ch, fcc_type, flask_base_url)
+                self._write_m3u_item(handle, channel, channel.category, http_host, http_port, path_mode, url_mode, catchup_days, catchup_template, op_ch, fcc_type, flask_base_url, path_prefix)
 
     def _write_m3u_item(
         self,
@@ -275,6 +292,7 @@ class ExportService:
         op_ch: dict[str, Any] | None = None,
         fcc_type: str = "",
         flask_base_url: str = "",
+        path_prefix: str = "",
     ) -> None:
         safe_group = group.replace('"', "'")
         tvg_name = (channel.tvg_name or channel.name).replace('"', "'")
@@ -283,7 +301,7 @@ class ExportService:
         if url_mode == "source" or not http_host:
             url = self.make_source_url(path_mode, channel.host, channel.port, channel.fcc_ip, channel.fcc_port, channel.fec_port, fcc_type)
         else:
-            url = self.make_http_url(http_host, http_port, path_mode, channel.host, channel.port, channel.fcc_ip, channel.fcc_port, channel.fec_port, fcc_type)
+            url = self.make_http_url(http_host, http_port, path_mode, channel.host, channel.port, channel.fcc_ip, channel.fcc_port, channel.fec_port, fcc_type, path_prefix)
         logo_attr = f' tvg-logo="{tvg_logo}"' if tvg_logo else ""
         # Catchup attributes for channels that support time-shift
         catchup_attr = ""
@@ -327,6 +345,7 @@ class ExportService:
         http_port: int,
         path_mode: str,
         fcc_type: str = "",
+        path_prefix: str = "",
     ) -> None:
         # Each source is written exactly once, grouped by its original category.
         grouped: dict[str, list[ChannelRecord]] = {category: [] for category in CATEGORY_OPTIONS}
@@ -353,7 +372,7 @@ class ExportService:
                 handle.write(f"{category},#genre#\n")
                 for channel in group_channels:
                     if http_host:
-                        url = self.make_http_url(http_host, http_port, path_mode, channel.host, channel.port, channel.fcc_ip, channel.fcc_port, channel.fec_port, fcc_type)
+                        url = self.make_http_url(http_host, http_port, path_mode, channel.host, channel.port, channel.fcc_ip, channel.fcc_port, channel.fec_port, fcc_type, path_prefix)
                     else:
                         url = self.make_source_url(path_mode, channel.host, channel.port, channel.fcc_ip, channel.fcc_port, channel.fec_port, fcc_type)
                     handle.write(f"{channel.name},{url}\n")
@@ -366,6 +385,7 @@ class ExportService:
         http_port: int,
         path_mode: str,
         fcc_type: str = "",
+        path_prefix: str = "",
     ) -> None:
         # Each source is written exactly once.
         with target.open("w", encoding="utf-8-sig", newline="") as handle:
@@ -389,12 +409,12 @@ class ExportService:
                 "抓到包数",
             ])
             for channel in channels:
-                self._write_csv_row(writer, channel, channel.category, http_host, http_port, path_mode, fcc_type)
+                self._write_csv_row(writer, channel, channel.category, http_host, http_port, path_mode, fcc_type, path_prefix)
 
-    def _write_csv_row(self, writer: csv.writer, channel: ChannelRecord, display_group: str, http_host: str, http_port: int, path_mode: str, fcc_type: str = "") -> None:
+    def _write_csv_row(self, writer: csv.writer, channel: ChannelRecord, display_group: str, http_host: str, http_port: int, path_mode: str, fcc_type: str = "", path_prefix: str = "") -> None:
         source = self.make_source_url(path_mode, channel.host, channel.port, channel.fcc_ip, channel.fcc_port, channel.fec_port, fcc_type)
         if http_host:
-            url = self.make_http_url(http_host, http_port, path_mode, channel.host, channel.port, channel.fcc_ip, channel.fcc_port, channel.fec_port, fcc_type)
+            url = self.make_http_url(http_host, http_port, path_mode, channel.host, channel.port, channel.fcc_ip, channel.fcc_port, channel.fec_port, fcc_type, path_prefix)
         else:
             url = source
         writer.writerow([

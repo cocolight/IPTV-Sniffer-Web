@@ -8,10 +8,12 @@ Covers:
 """
 import os
 import gzip
+import io
 import json
 import struct
 import sys
 import tempfile
+import zipfile
 
 import pytest
 
@@ -19,16 +21,19 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from services.stb_discovery_service import (
     _extract_ctc_portal_auth,
+    _extract_epg_credentials,
     _parse_channel_acquire_json,
     _parse_chanlist_html,
     _parse_pc_channel_catalog,
     _reassemble_tcp_streams,
+    StbDiscoveryService,
     analyze_pcap_for_channels,
 )
 from services.export_service import ExportService
 from services.epg_refresh_service import _pad_des_plaintext
 from services.iptv_auth_service import IptvAuthService
 import services.iptv_auth_service as iptv_auth_module
+import services.stb_discovery_service as stb_discovery_module
 from services.log_service import AppLogger
 import app as app_module
 from app import (
@@ -39,7 +44,7 @@ from app import (
     parse_exported_m3u_channels,
 )
 from services.epg_service import EpgService, normalize_channel_name
-from services.storage_service import ChannelStore
+from services.storage_service import ChannelStore, StbTokenStore
 from utils import channel_group_key, redact_sensitive_text
 
 
@@ -148,6 +153,27 @@ class TestPcapLinkTypes:
             os.unlink(path)
         data = streams[(SRV, SPORT, STB, DPORT)]
         assert data.index(b"first ") < data.index(b"second")
+
+    def test_longer_retransmission_replaces_partial_same_sequence(self):
+        partial = _eth_frame(STB, SRV, DPORT, SPORT, SEQ, b"POST /a")
+        complete_payload = b"POST /auth HTTP/1.1\r\n\r\nUserID=10001&STBID=STB123"
+        complete = _eth_frame(STB, SRV, DPORT, SPORT, SEQ, complete_payload)
+        path = _write_pcap(1, [partial, complete])
+        try:
+            streams = _reassemble_tcp_streams(path)
+        finally:
+            os.unlink(path)
+        assert streams[(STB, DPORT, SRV, SPORT)] == complete_payload
+
+    def test_overlapping_tcp_segments_are_not_duplicated(self):
+        p1 = _eth_frame(SRV, STB, SPORT, DPORT, SEQ, b"abcdef")
+        p2 = _eth_frame(SRV, STB, SPORT, DPORT, SEQ + 3, b"defghi")
+        path = _write_pcap(1, [p1, p2])
+        try:
+            streams = _reassemble_tcp_streams(path)
+        finally:
+            os.unlink(path)
+        assert streams[(SRV, SPORT, STB, DPORT)] == b"abcdefghi"
 
 
 # ── CUSetConfig parsing tests ─────────────────────────────────────────────
@@ -394,6 +420,166 @@ def test_ctc_portal_auth_fields_are_extracted_from_stb_boot_streams():
     assert parsed["x_frame_session_id"] == "SESSION123"
 
 
+def test_ctc_portal_auth_accepts_lowercase_form_fields_and_device_alias():
+    stb_ip = "192.168.100.13"
+    srv_ip = "10.7.10.10"
+    request = (
+        b"POST /authLoginHWCTC HTTP/1.1\r\n"
+        b"Host: itv.example:8298\r\n"
+        b"Content-Type: application/x-www-form-urlencoded\r\n\r\n"
+        b"userid=10001&deviceid=STB123&stbtype=EC6108V9&stbversion=V100R005"
+    )
+    streams = {(stb_ip, 50000, srv_ip, 8298): request}
+    portal = _extract_ctc_portal_auth(streams, stb_ip)
+    epg = _extract_epg_credentials(streams, stb_ip)
+
+    assert portal["epg_user_id"] == "10001"
+    assert portal["epg_stb_id"] == "STB123"
+    assert portal["epg_stb_type"] == "EC6108V9"
+    assert portal["epg_stb_version"] == "V100R005"
+    assert epg["epg_stb_id"] == "STB123"
+
+
+def test_epg_credentials_prefer_standard_eds_port_over_control_traffic():
+    streams = {
+        (STB, 50000, SRV, 9090): b"GET /EDS/jsp/AuthenticationURL?UserID=10001 HTTP/1.1\r\n\r\n",
+        (STB, 50001, SRV, 8082): b"GET /EDS/jsp/AuthenticationURL?UserID=10001 HTTP/1.1\r\n\r\n",
+    }
+    parsed = _extract_epg_credentials(streams, STB)
+
+    assert parsed["epg_auth_host"] == f"{SRV}:8082"
+
+
+def test_stb_capture_archive_persists_raw_pcap(tmp_path):
+    capture = tmp_path / "capture.pcap"
+    capture.write_bytes(b"pcap-test")
+    archive_dir = tmp_path / "stb-captures"
+    service = StbDiscoveryService(object(), archive_dir=archive_dir)
+
+    archive_name = service._archive_pcap(str(capture), 1_700_000_000)
+
+    archived = archive_dir / archive_name
+    assert archive_name.endswith(".pcap")
+    assert archived.read_bytes() == b"pcap-test"
+    assert (archived.stat().st_mode & 0o777) == 0o600
+    archives = service.list_archives()
+    assert archives[0]["name"] == archive_name
+    assert archives[0]["size"] == len(b"pcap-test")
+    assert service.latest_archive_path() == archived
+
+
+def test_stb_capture_archive_exports_raw_pcap_and_portable_backup(monkeypatch, tmp_path):
+    """A persistent capture must remain downloadable after its temp file is gone."""
+    archive_dir = tmp_path / "stb-captures"
+    archive_dir.mkdir()
+    archived = archive_dir / "stb-boot-20260901-010203-000000001.pcap"
+    raw_pcap = b"pcap-private-test-payload"
+    archived.write_bytes(raw_pcap)
+    metadata_dir = archive_dir / f"{archived.stem}.artifacts"
+    metadata_dir.mkdir()
+    (metadata_dir / "manifest.json").write_text('{"redacted": true}', encoding="utf-8")
+
+    monkeypatch.setattr(app_module.stb_discovery_service, "pcap_path", lambda: "")
+    monkeypatch.setattr(app_module.stb_discovery_service, "latest_archive_path", lambda: archived)
+    monkeypatch.setattr(
+        app_module.stb_discovery_service,
+        "status",
+        lambda: {"stopped_at": 1_700_000_000},
+    )
+
+    client = app_module.app.test_client()
+    raw_response = client.get("/api/stb_discovery/pcap")
+    assert raw_response.status_code == 200
+    assert raw_response.data == raw_pcap
+    assert "attachment" in raw_response.headers["Content-Disposition"]
+
+    monkeypatch.setattr(app_module.stb_discovery_service, "archive_path", lambda name: archived if name == archived.name else None)
+    selected_response = client.get(f"/api/stb_discovery/pcap?archive={archived.name}")
+    assert selected_response.status_code == 200
+    assert selected_response.data == raw_pcap
+
+    backup_response = client.get("/api/stb_discovery/archive-backup")
+    assert backup_response.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(backup_response.data)) as bundle:
+        assert bundle.read(f"raw/{archived.name}") == raw_pcap
+        assert bundle.read(f"metadata/{archived.stem}.manifest.json") == b'{"redacted": true}'
+        assert "raw local STB PCAP" in bundle.read("README.txt").decode("utf-8")
+
+    selected_backup = client.get(f"/api/stb_discovery/archive-backup?archive={archived.name}")
+    assert selected_backup.status_code == 200
+
+
+def test_stb_capture_archive_can_be_reanalyzed_without_new_boot(tmp_path):
+    archive_dir = tmp_path / "stb-captures"
+    archive_dir.mkdir()
+    payload = (
+        b"POST /authLoginHWCTC HTTP/1.1\r\n"
+        b"User-Agent: test-stb-agent\r\n\r\n"
+        b"userid=10001&stbid=STB123&stbtype=EC6108V9&stbversion=V100R005"
+        b"&netuserid=10001&conntype=1&lang=1"
+    )
+    capture = archive_dir / "stb-boot-20260101-000000.pcap"
+    capture.write_bytes(_make_pcap(1, [_eth_frame(STB, SRV, DPORT, SPORT, SEQ, payload)]))
+    service = StbDiscoveryService(object(), archive_dir=archive_dir)
+
+    state = service.reanalyze_latest_archive(STB)
+
+    assert state["status"] == service.STATUS_DONE
+    assert state["archived_pcap"] == capture.name
+    assert state["epg_creds"]["epg_stb_id"] == "STB123"
+    assert state["epg_creds"]["epg_stb_type"] == "EC6108V9"
+    assert state["epg_creds"]["epg_stb_version"] == "V100R005"
+    assert state["epg_creds"]["epg_user_agent"] == "test-stb-agent"
+
+
+def test_iptv_auth_falls_back_to_persisted_stb_auth(monkeypatch):
+    monkeypatch.setattr(app_module.stb_discovery_service, "status", lambda: {"auth_info": {}})
+    monkeypatch.setattr(
+        app_module.token_store,
+        "load_auth_info",
+        lambda: {"mac": "aa:bb:cc:dd:ee:ff", "assigned_ip": "10.1.2.3"},
+    )
+
+    assert app_module._latest_stb_auth_info() == {
+        "mac": "aa:bb:cc:dd:ee:ff",
+        "assigned_ip": "10.1.2.3",
+    }
+
+
+def test_partial_live_stb_auth_does_not_erase_persisted_identity(monkeypatch):
+    monkeypatch.setattr(
+        app_module.stb_discovery_service,
+        "status",
+        lambda: {"auth_info": {"mac": "aa:bb:cc:dd:ee:ff"}},
+    )
+    monkeypatch.setattr(
+        app_module.token_store,
+        "load_auth_info",
+        lambda: {
+            "mac": "aa:bb:cc:dd:ee:ff",
+            "assigned_ip": "10.1.2.3",
+            "hostname": "stb-host",
+            "vendor_class": "001122",
+        },
+    )
+
+    assert app_module._latest_stb_auth_info() == {
+        "mac": "aa:bb:cc:dd:ee:ff",
+        "assigned_ip": "10.1.2.3",
+        "hostname": "stb-host",
+        "vendor_class": "001122",
+    }
+
+
+def test_stb_token_update_keeps_persisted_dhcp_identity(tmp_path):
+    store = StbTokenStore(tmp_path / "playlist_token.json")
+    auth_info = {"mac": "aa:bb:cc:dd:ee:ff", "assigned_ip": "10.1.2.3"}
+    store.save_auth_info(auth_info)
+
+    assert store.save_token({"token": "TOKEN123", "dip": "10.7.10.10"}) is True
+    assert store.load_auth_info() == auth_info
+
+
 def test_des_authenticator_defaults_to_pkcs5_padding():
     assert _pad_des_plaintext(b"12345678") == b"12345678" + (b"\x08" * 8)
     assert _pad_des_plaintext(b"12345678", padding="zero") == b"12345678"
@@ -409,6 +595,17 @@ class TestExportUrl:
     def test_fcc(self):
         url = ExportService.make_http_url("h", 5140, "rtp", "239.1.1.1", 8008, "10.0.0.1", 9000)
         assert "?fcc=10.0.0.1:9000" in url
+
+    def test_fnos_app_path_prefix(self):
+        url = ExportService.make_http_url(
+            "h", 5140, "rtp", "239.1.1.1", 8008,
+            "10.0.0.1", 9000, path_prefix="/app/rtp2httpd/",
+        )
+        assert url == "http://h:5140/app/rtp2httpd/rtp/239.1.1.1:8008?fcc=10.0.0.1:9000"
+
+    def test_invalid_app_path_prefix_rejected(self):
+        with pytest.raises(ValueError, match="路径前缀"):
+            ExportService.make_http_url("h", 5140, "rtp", "239.1.1.1", 8008, path_prefix="/../status")
 
     def test_fcc_type_with_fcc(self):
         url = ExportService.make_http_url("h", 5140, "rtp", "239.1.1.1", 8008,
@@ -639,7 +836,107 @@ def test_sensitive_iptv_tokens_are_redacted_before_logging():
     assert "rtsp://<redacted>" in redacted
 
 
+def test_protocol_evidence_archive_keeps_only_redacted_summary(tmp_path):
+    """Capture summary remains useful without duplicating credential-bearing payloads."""
+    stb = "10.0.0.2"
+    epg = "10.0.0.9"
+    auth_body = b"Authenticator=private-auth&UserID=10001"
+    auth_request = (
+        b"POST /EPG/jsp/ValidAuthenticationHWCU.jsp HTTP/1.1\r\n"
+        b"Cookie: prior=private-cookie\r\n"
+        + f"Content-Length: {len(auth_body)}\r\n\r\n".encode()
+        + auth_body
+    )
+    channel_body = b"UserToken=private-token"
+    channel_request = (
+        b"POST /EPG/jsp/getchannellistHWCU.jsp HTTP/1.1\r\n"
+        + f"Content-Length: {len(channel_body)}\r\n\r\n".encode()
+        + channel_body
+    )
+    response = (
+        b"HTTP/1.1 200 OK\r\nSet-Cookie: JSESSIONID=private-session; Path=/\r\n"
+        b"Content-Length: 0\r\n\r\n"
+    )
+    frames = [
+        _eth_frame(stb, epg, 50000, 8082, 1, auth_request),
+        _eth_frame(stb, epg, 50000, 8082, len(auth_request) + 1, channel_request),
+        _eth_frame(epg, stb, 8082, 50000, 1, response),
+    ]
+    pcap = _write_pcap(1, frames)
+    archive_dir = tmp_path / "stb-captures"
+    service = StbDiscoveryService(AppLogger(tmp_path / "app.log"), archive_dir=archive_dir)
+
+    summary = service._persist_protocol_artifacts(pcap, "capture.pcap")
+
+    assert summary == {
+        "saved": True,
+        "auth_forms": 1,
+        "channel_requests": 1,
+        "response_streams": 1,
+    }
+    artifact_dir = archive_dir / "capture.artifacts"
+    manifest = (artifact_dir / "manifest.json").read_text(encoding="utf-8")
+    assert "private-auth" not in manifest
+    assert "private-cookie" not in manifest
+    assert "private-session" not in manifest
+    assert "ValidAuthenticationHWCU.jsp" in manifest
+    assert '"request_has_cookie": true' in manifest
+    assert '"response_sets_cookie": true' in manifest
+    assert not list(artifact_dir.glob("*.http"))
+    assert not list(artifact_dir.glob("*.bin"))
+    assert (artifact_dir / "manifest.json").stat().st_mode & 0o777 == 0o600
+
+
 # ── Multicast link diagnostic ─────────────────────────────────────────────
+
+def test_stb_full_capture_keeps_all_stb_traffic_and_dhcp(tmp_path, monkeypatch):
+    service = StbDiscoveryService(AppLogger(tmp_path / "app.log"), archive_dir=tmp_path / "archives")
+    commands = []
+
+    class _FakeProc:
+        stdout = io.BytesIO()
+        stderr = io.BytesIO()
+
+    class _FakeThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(stb_discovery_module.shutil, "which", lambda name: "/usr/sbin/tcpdump")
+    monkeypatch.setattr(stb_discovery_module.tempfile, "mktemp", lambda **kwargs: str(tmp_path / "capture.pcap"))
+    monkeypatch.setattr(stb_discovery_module.subprocess, "Popen", lambda command, **kwargs: commands.append(command) or _FakeProc())
+    monkeypatch.setattr(stb_discovery_module.threading, "Thread", _FakeThread)
+
+    service.start("10.0.0.8", "enp3s0")
+
+    assert commands[0][-1] == "host 10.0.0.8 or (udp and (port 67 or port 68))"
+
+
+def test_stb_full_capture_avoids_stale_ip_filter(tmp_path, monkeypatch):
+    service = StbDiscoveryService(AppLogger(tmp_path / "app.log"), archive_dir=tmp_path / "archives")
+    commands = []
+
+    class _FakeProc:
+        stdout = io.BytesIO()
+        stderr = io.BytesIO()
+
+    class _FakeThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(stb_discovery_module.shutil, "which", lambda name: "/usr/sbin/tcpdump")
+    monkeypatch.setattr(stb_discovery_module.tempfile, "mktemp", lambda **kwargs: str(tmp_path / "capture.pcap"))
+    monkeypatch.setattr(stb_discovery_module.subprocess, "Popen", lambda command, **kwargs: commands.append(command) or _FakeProc())
+    monkeypatch.setattr(stb_discovery_module.threading, "Thread", _FakeThread)
+
+    service.start("10.0.0.8", "enp3s0", full_capture=True)
+
+    assert commands[0][-1] == str(tmp_path / "capture.pcap")
 
 class TestMulticastDiagnostic:
     def _service(self, tmp_path):
@@ -683,6 +980,7 @@ upstream-interface = enp3s0
 upstream-interface-fcc = enp2s0
 external-m3u = file:///vol1/@appshare/rtp2httpd/channels.m3u
 status-page-path = /status
+app-path-prefix = /app/rtp2httpd
 
 [bind]
 * 5140
@@ -691,6 +989,7 @@ status-page-path = /status
     assert values["upstream-interface"] == "enp3s0"
     assert values["upstream-interface-fcc"] == "enp2s0"
     assert values["external-m3u"].endswith("channels.m3u")
+    assert values["app-path-prefix"] == "/app/rtp2httpd"
     assert parsed["bind"] == ["* 5140"]
 
 
@@ -712,7 +1011,33 @@ def test_iptv_auth_payload_and_hook_include_option60_and_interface(tmp_path):
     assert payload["vendor_class"] == "00001f3901c4693f"
     assert payload["vendor_class_colon"] == "00:00:1f:39:01:c4:69:3f"
     assert 'LOG="/app/data/iptv-auth-enp3s0.log"' in hook
+    assert 'PATH="/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"' in hook
+    assert 'udhcpc hook_stage=deconfig_preserved' in hook
+    deconfig_block = hook.split('  deconfig)\n', 1)[1].split('  bound|renew)', 1)[0]
+    assert 'ip -4 addr flush dev "$interface" || true' not in deconfig_block
+    assert 'udhcpc hook_stage=bound_configured' in hook
     assert 'ip -4 route replace 224.0.0.0/4 dev "$interface"' in hook
+    private_hook = svc._udhcpc_hook_content(payload["interface"], "iptv_private")
+    assert 'ip -4 route replace 10.0.0.0/8 via "$router" dev "$interface" onlink metric 50' in private_hook
+
+
+def test_iptv_auth_snapshot_accepts_scoped_route_without_dev(tmp_path, monkeypatch):
+    svc = IptvAuthService(tmp_path / "auth-backup.json", tmp_path, AppLogger(tmp_path / "app.log"))
+
+    def fake_json_cmd(cmd):
+        if cmd[:3] == ["ip", "-j", "link"]:
+            return [{"ifname": "enp3s0", "flags": ["UP"], "operstate": "UP"}]
+        if cmd[:3] == ["ip", "-j", "addr"]:
+            return [{"ifname": "enp3s0", "address": "d4:c1:c8:ee:9b:1f", "addr_info": []}]
+        if cmd[:4] == ["ip", "-j", "-4", "route"]:
+            # ``ip -j route show dev IFACE`` may omit the already-scoped dev.
+            return [{"dst": "10.0.0.0/8", "gateway": "10.193.224.1", "flags": ["onlink"]}]
+        return []
+
+    monkeypatch.setattr(svc, "_json_cmd", fake_json_cmd)
+    snapshot = svc.snapshot("enp3s0")
+
+    assert snapshot["has_private_route"] is True
 
 
 def test_iptv_auth_detects_egress_bpf_and_clsact_drops(tmp_path, monkeypatch):

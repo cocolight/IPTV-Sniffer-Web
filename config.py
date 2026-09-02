@@ -7,8 +7,8 @@ import os
 from pathlib import Path
 
 APP_NAME = "IPTV Sniffer Web"
-APP_VERSION = "1.2.9"
-APP_DESCRIPTION = "IPTV 运营商频道发现、线路整理与 rtp2httpd 播放列表统一工作台"
+APP_VERSION = "1.3.0"
+APP_DESCRIPTION = "IPTV 频道发现、订阅管理、回看与 rtp2httpd 播放统一工作台"
 GITHUB_REPO = "roninriddle/IPTV-Sniffer-Web"
 VERSION_CHECK_INTERVAL = 6 * 3600
 
@@ -17,6 +17,7 @@ DATA_DIR = Path(os.environ.get("DATA_DIR", str(BASE_DIR / "data"))).resolve()
 OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", str(BASE_DIR / "output"))).resolve()
 LOG_FILE = Path(os.environ.get("LOG_FILE", str(DATA_DIR / "app.log"))).resolve()
 SETTINGS_FILE = DATA_DIR / "settings.json"
+EPG_KEY_FILE = DATA_DIR / "epg-key.secret"
 CHANNELS_FILE = DATA_DIR / "channels.json"
 FCC_FILE = DATA_DIR / "fcc.json"
 STB_TOKEN_FILE = DATA_DIR / "playlist_token.json"
@@ -25,6 +26,7 @@ EPG_CACHE_FILE = DATA_DIR / "epg_cache.json"
 OPERATOR_CHANNELS_FILE = DATA_DIR / "operator_channels.json"
 SNAPSHOTS_FILE = DATA_DIR / "channel_snapshots.json"
 IPTV_AUTH_BACKUP_FILE = DATA_DIR / "iptv_auth_backups.json"
+SUBSCRIPTION_FILE = DATA_DIR / "subscription_candidates.json"
 
 WEB_HOST = os.environ.get("WEB_HOST", "0.0.0.0")
 WEB_PORT = int(os.environ.get("WEB_PORT", "8787"))
@@ -72,6 +74,7 @@ DEFAULT_SETTINGS = {
     "interface": "",
     "http_host": DEFAULT_RTP2HTTP_HOST,
     "http_port": DEFAULT_RTP2HTTP_PORT,
+    "rtp2httpd_path_prefix": "",
     "rtp2httpd_config_path": DEFAULT_RTP2HTTPD_CONFIG_PATH,
     "path_mode": DEFAULT_PATH_MODE if DEFAULT_PATH_MODE in {"rtp", "udp"} else "rtp",
     "duration": DEFAULT_CAPTURE_SECONDS,
@@ -95,13 +98,20 @@ DEFAULT_SETTINGS = {
     "epg_stb_id": "",
     "epg_des3_key": "",
     "epg_auth_host": "",
-    "epg_auth_profile": "auto",
+    # The local deployment is China Unicom on a Huawei HWCU portal. Other
+    # carrier/platform flows remain explicit opt-ins instead of hidden fallbacks.
+    "epg_auth_profile": "cu_hwcu",
     "epg_crypto_mode": "auto",
     "epg_des_padding": "pkcs5",
     "epg_stb_type": "",
     "epg_stb_version": "",
     "epg_user_agent": "",
     "epg_access_user_name": "",
+    # Learned from a local STB trace and used internally by the HWCU refresh
+    # flow.  They are deliberately not exported in public playlist URLs.
+    "epg_net_user_id": "",
+    "epg_conn_type": "",
+    "epg_lang": "1",
     "fcc_type": "",
     "pre_export_health_check": False,
 }
