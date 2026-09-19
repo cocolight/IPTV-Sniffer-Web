@@ -468,6 +468,39 @@ def test_stb_capture_archive_persists_raw_pcap(tmp_path):
     assert service.latest_archive_path() == archived
 
 
+def test_stb_capture_archive_delete_requires_explicit_confirmation_and_removes_artifacts(monkeypatch, tmp_path):
+    archive_dir = tmp_path / "stb-captures"
+    archive_dir.mkdir()
+    archived = archive_dir / "stb-boot-20260901-010203-000000001.pcap"
+    archived.write_bytes(b"pcap-private-test-payload")
+    metadata_dir = archive_dir / f"{archived.stem}.artifacts"
+    metadata_dir.mkdir()
+    (metadata_dir / "manifest.json").write_text('{"redacted": true}', encoding="utf-8")
+    service = StbDiscoveryService(object(), archive_dir=archive_dir)
+    monkeypatch.setattr(app_module, "stb_discovery_service", service)
+    client = app_module.app.test_client()
+
+    denied = client.delete(f"/api/stb_discovery/archives/{archived.name}", json={})
+    assert denied.status_code == 400
+    assert archived.exists()
+    assert metadata_dir.exists()
+
+    deleted = client.delete(
+        f"/api/stb_discovery/archives/{archived.name}",
+        json={"confirmed": True},
+    )
+    assert deleted.status_code == 200
+    assert deleted.get_json()["data"]["artifacts_deleted"] is True
+    assert not archived.exists()
+    assert not metadata_dir.exists()
+
+    missing = client.delete(
+        f"/api/stb_discovery/archives/{archived.name}",
+        json={"confirmed": True},
+    )
+    assert missing.status_code == 404
+
+
 def test_stb_capture_archive_exports_raw_pcap_and_portable_backup(monkeypatch, tmp_path):
     """A persistent capture must remain downloadable after its temp file is gone."""
     archive_dir = tmp_path / "stb-captures"
@@ -1094,14 +1127,14 @@ def test_iptv_auth_clear_egress_bpf_only_targets_selected_interface(tmp_path, mo
 
     monkeypatch.setattr(iptv_auth_module.shutil, "which", fake_which)
     monkeypatch.setattr(iptv_auth_module, "_run", fake_run)
-    result = svc.clear_egress_bpf({"interface": "enp3s0", "confirm": "确认解除"})
+    result = svc.clear_egress_bpf({"interface": "enp3s0", "confirmed": True})
     assert result["changed"] is True
     assert result["interface"] == "enp3s0"
     assert ["tc", "filter", "del", "dev", "enp3s0", "egress", "protocol", "all", "pref", "49152"] in calls
     assert all("enp2s0" not in cmd for cmd in calls)
 
 
-def test_iptv_auth_watch_requires_confirmation_when_enabling(tmp_path, monkeypatch):
+def test_iptv_auth_watch_requires_explicit_confirmation_when_enabling(tmp_path, monkeypatch):
     svc = IptvAuthService(tmp_path / "auth-backup.json", tmp_path, AppLogger(tmp_path / "app.log"))
 
     def fake_run(cmd, timeout=12, check=False):
@@ -1115,13 +1148,12 @@ def test_iptv_auth_watch_requires_confirmation_when_enabling(tmp_path, monkeypat
             "enabled": True,
             "interface": "enp3s0",
             "interval_seconds": 30,
-            "confirm": "wrong",
         })
     data = svc.configure_egress_bpf_watch({
         "enabled": True,
         "interface": "enp3s0",
         "interval_seconds": 5,
-        "confirm": "确认恢复",
+        "confirmed": True,
     })
     assert data["config"]["enabled"] is True
     assert data["config"]["interface"] == "enp3s0"
@@ -1375,7 +1407,7 @@ def test_global_backup_and_clear_include_subscription_candidates(tmp_path, monke
     exported = client.get("/api/backup/export")
     assert json.loads(exported.data)["subscription_candidates"]["candidate_ids"] == ["c-1001"]
 
-    cleared = client.post("/api/backup/clear-all", json={"confirm": "确认清除"})
+    cleared = client.post("/api/backup/clear-all", json={"confirmed": True})
     assert cleared.status_code == 200
     assert "subscription_candidates" in cleared.get_json()["data"]["cleared"]
     assert not subscription_path.exists()

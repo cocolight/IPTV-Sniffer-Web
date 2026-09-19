@@ -112,6 +112,31 @@ def _extract_first(patterns: list[str], text: str) -> str:
     return ""
 
 
+def _extract_portal_config(text: str, *names: str) -> str:
+    """Extract one Huawei portal config value from an authenticated response."""
+    for name in names:
+        pattern = re.compile(
+            rf"(?:(?:Authentication\.)?(?:CUSetConfig|CTCSetConfig)|jsSetConfig)"
+            rf"\s*\(\s*(['\"]){re.escape(name)}\1\s*,\s*(['\"])(.*?)\2\s*\)",
+            re.IGNORECASE | re.DOTALL,
+        )
+        match = pattern.search(text or "")
+        if match:
+            return urllib.parse.unquote((match.group(3) or "").strip())
+    return ""
+
+
+def _channel_config_blocks(text: str) -> list[str]:
+    call_re = re.compile(
+        r"""(?:(?:Authentication\.)?(?:CUSetConfig|CTCSetConfig)|jsSetConfig)\s*\(
+            \s*(?P<key_quote>['"])Channel(?P=key_quote)\s*,
+            \s*(?P<value_quote>['"])(?P<value>.*?)(?P=value_quote)\s*\)
+        """,
+        re.DOTALL | re.VERBOSE,
+    )
+    return [match.group("value") for match in call_re.finditer(text or "")]
+
+
 def _session_expiry_info(jar: Any) -> tuple[int | None, str]:
     jsession_seen = False
     expiries: list[int] = []
@@ -144,8 +169,7 @@ def _update_backtv_from_channel_text(
     playlist.  This lets a restored installation recover without requiring a
     second STB boot capture, provided its EPG authentication is available.
     """
-    blocks = re.findall(r"CUSetConfig\('Channel',\s*'([^']+)'\)", text)
-    blocks += re.findall(r'CUSetConfig\("Channel",\s*"([^"]+)"\)', text)
+    blocks = _channel_config_blocks(text)
     updated = 0
     rebuilt = 0
     total = len(blocks)
@@ -227,6 +251,7 @@ def _refresh_huawei_epg(
     user_agent = str(settings.get("epg_user_agent") or "").strip()
     stb_type = str(settings.get("epg_stb_type") or "").strip()
     stb_version = str(settings.get("epg_stb_version") or "").strip()
+    software_version = str(settings.get("epg_software_version") or "").strip()
     access_user_name = str(settings.get("epg_access_user_name") or "").strip()
     mac_colon = ":".join(mac_plain[index:index + 2] for index in range(0, len(mac_plain), 2))
     net_user_id = str(settings.get("epg_net_user_id") or mac_colon).strip()
@@ -249,7 +274,8 @@ def _refresh_huawei_epg(
     headers = {
         "User-Agent": user_agent,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "X-Requested-With": "com.android.smart.terminal.iptv",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+        "Upgrade-Insecure-Requests": "1",
     }
     logger.info(f"{protocol_label} 步骤1：获取 AuthenticationURL / EncryptToken")
     token_url = f"{base_url}/EDS/jsp/AuthenticationURL?UserID={urllib.parse.quote(user_id)}&Action=Login"
@@ -259,9 +285,13 @@ def _refresh_huawei_epg(
     login_url = f"http://{final_host}/EPG/jsp/authLogin{portal_suffix}.jsp"
     login_headers = {
         "User-Agent": user_agent,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+        "Cache-Control": "max-age=0",
         "Content-Type": "application/x-www-form-urlencoded",
+        "Origin": f"http://{final_host}",
         "Referer": f"http://{final_host}/EPG/jsp/AuthenticationURL?UserID={urllib.parse.quote(user_id)}&Action=Login",
-        "X-Requested-With": "com.android.smart.terminal.iptv",
+        "Upgrade-Insecure-Requests": "1",
     }
     login_body, _ = _request_text(opener, login_url, data={"UserID": user_id, "VIP": ""}, headers=login_headers, timeout=15)
     combined = first_body + "\n" + login_body
@@ -297,8 +327,8 @@ def _refresh_huawei_epg(
         "userToken": encrypt_token,
         "userGroupId": "",
         "productPackageId": "",
-        "mac": mac_colon,
-        "SoftwareVersion": "",
+        "mac": mac_plain,
+        "SoftwareVersion": software_version,
         "VIP": "",
     }
     if access_user_name:
@@ -308,19 +338,33 @@ def _refresh_huawei_epg(
         opener,
         validate_url,
         data=validate_data,
-        headers={"User-Agent": user_agent, "Content-Type": "application/x-www-form-urlencoded", "Referer": login_url},
+        headers={
+            "User-Agent": user_agent,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+            "Cache-Control": "max-age=0",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Origin": f"http://{final_host}",
+            "Referer": login_url,
+            "Upgrade-Insecure-Requests": "1",
+        },
         timeout=15,
     )
     jsessionid = _get_jsessionid(jar)
-    user_token = _extract_first([
+    user_token = _extract_portal_config(validate_body, "UserToken") or _extract_first([
         r'UserToken["\']?\s+value=["\']([^"\']+)["\']',
         r'name=["\']UserToken["\'][^>]+value=["\']([^"\']+)["\']',
         r"UserToken=([A-Za-z0-9+/=%]+)",
     ], validate_body) or encrypt_token
-    stbid_from_resp = _extract_first([
+    stbid_from_resp = _extract_portal_config(validate_body, "stbid", "STBID") or _extract_first([
         r'stbid["\']?\s+value=["\']([^"\']+)["\']',
         r'name=["\']stbid["\'][^>]+value=["\']([^"\']+)["\']',
     ], validate_body) or stb_id
+    channel_conn_type = _extract_portal_config(validate_body, "conntype") or conn_type
+    channel_temp_key = _extract_portal_config(validate_body, "identityEncode", "tempKey")
+    channel_support_hd = _extract_portal_config(validate_body, "SupportHD") or "1"
+    channel_user_id = _extract_portal_config(validate_body, "UserID") or user_id
+    channel_lang = _extract_portal_config(validate_body, "Lang") or lang
     if not jsessionid:
         raise RuntimeError(f"{protocol_label} 未建立认证会话，请检查已合法配置的认证参数与设备信息")
 
@@ -335,27 +379,38 @@ def _refresh_huawei_epg(
                 opener,
                 chanlist_url,
                 data={
-                    "conntype": conn_type,
+                    "conntype": channel_conn_type,
                     "UserToken": user_token,
-                    "tempKey": "",
+                    "tempKey": channel_temp_key,
                     "stbid": stbid_from_resp,
-                    "SupportHD": "1",
-                    "UserID": user_id,
-                    "Lang": lang,
+                    "SupportHD": channel_support_hd,
+                    "UserID": channel_user_id,
+                    "Lang": channel_lang,
                 },
-                headers={"User-Agent": user_agent, "Content-Type": "application/x-www-form-urlencoded"},
+                headers={
+                    "User-Agent": user_agent,
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "zh-CN,zh;q=0.9",
+                    "Cache-Control": "max-age=0",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Origin": f"http://{final_host}",
+                    "Referer": validate_url,
+                    "Upgrade-Insecure-Requests": "1",
+                },
                 timeout=20,
             )
-            if "CUSetConfig" in body:
+            if _channel_config_blocks(body):
                 chanlist_body = body
                 break
-            errors.append(f"{endpoint}: 响应中未找到 CUSetConfig 块")
+            errors.append(f"{endpoint}: 认证响应有效，但未返回频道配置块")
         except Exception as exc:
             errors.append(f"{endpoint}: {exc}")
     if not chanlist_body:
         raise RuntimeError(f"{protocol_label} 无法获取频道表：{'; '.join(errors) or '响应为空'}")
 
     updated, rebuilt, total = _update_backtv_from_channel_text(chanlist_body, operator_channels)
+    if total <= 0:
+        raise RuntimeError(f"{protocol_label} 已建立会话，但频道表为空")
     expires_at, expiry_note = _session_expiry_info(jar)
     logger.info(f"{protocol_label} 回看地址刷新完成：共解析 {total} 个频道块，更新 {updated} 个，重建 {rebuilt} 个")
     return {
@@ -461,7 +516,7 @@ def refresh_backtv_urls(
             logger.warning(f"CTC-HWCTC 回看刷新失败：{redact_sensitive_text(str(exc))}")
 
     if profile == "cu_hwcu":
-        raise ValueError("联通 HWCU 回看需要已合法配置的 DES/3DES key、UserAgent、STBType、STBVersion；请在 8788 设置页面完成配置后重试")
+        raise ValueError("联通 HWCU 回看需要已合法配置的 DES/3DES key、UserAgent、STBType、STBVersion；请在当前实例的设置页面完成配置后重试")
     if not hwcu_ready and not ctc_ready:
         raise ValueError("已捕获的联通 HWCU 回看流程需要 DES/3DES key、UserAgent、STBType、STBVersion；请补齐缺失参数")
     raise RuntimeError("HWCU 与 CTC-HWCTC 回看认证均失败，请检查认证参数或查看日志详情")

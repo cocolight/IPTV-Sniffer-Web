@@ -323,15 +323,13 @@ async function loadSettings() {
   if ($("epgUserId")) $("epgUserId").value = data.epg_user_id || "";
   if ($("epgStbId")) $("epgStbId").value = data.epg_stb_id || "";
   if ($("epgDes3Key")) {
-    $("epgDes3Key").value = "";
-    $("epgDes3Key").placeholder = data.epg_des3_key_configured
-      ? "已在本机保存；留空则保持不变"
-      : "8 / 16 / 24 位密钥；保存后不会再次显示";
+    $("epgDes3Key").value = data.epg_des3_key || "";
+    $("epgDes3Key").placeholder = "8 / 16 / 24 位密钥";
   }
   if ($("epgDes3KeyStatus")) {
     $("epgDes3KeyStatus").textContent = data.epg_des3_key_configured
-      ? "已本机保存；刷新可使用，网页和 JSON 全局备份均不会显示。"
-      : "仅保存在本机数据卷，不包含在 JSON 全局备份中。";
+      ? "已本机保存并明文显示；导出时可单独选择是否包含在备份中。"
+      : "明文显示在本机管理页面；导出时可单独选择是否包含在备份中。";
   }
   if ($("epgAuthHost")) $("epgAuthHost").value = data.epg_auth_host || "";
   if ($("epgAuthProfile")) $("epgAuthProfile").value = data.epg_auth_profile || "auto";
@@ -339,6 +337,7 @@ async function loadSettings() {
   if ($("epgDesPadding")) $("epgDesPadding").value = data.epg_des_padding || "pkcs5";
   if ($("epgStbType")) $("epgStbType").value = data.epg_stb_type || "";
   if ($("epgStbVersion")) $("epgStbVersion").value = data.epg_stb_version || "";
+  if ($("epgSoftwareVersion")) $("epgSoftwareVersion").value = data.epg_software_version || "";
   if ($("epgUserAgent")) $("epgUserAgent").value = data.epg_user_agent || "";
   if ($("epgAccessUserName")) $("epgAccessUserName").value = data.epg_access_user_name || "";
   if ($("refreshBacktvBtn")) $("refreshBacktvBtn").style.display = data.catchup_enabled ? "" : "none";
@@ -445,7 +444,14 @@ function subscriptionUrl(path) {
 function renderSubscription(data) {
   state.subscription = data;
   const urls = data.urls || {};
-  const ids = {best: "subscriptionBestUrl", all: "subscriptionAllUrl", hls: "subscriptionHlsUrl", epg: "subscriptionEpgUrl"};
+  const ids = {
+    best: "subscriptionBestUrl",
+    all: "subscriptionAllUrl",
+    hls: "subscriptionHlsUrl",
+    rtp2httpd: "subscriptionRtp2httpdUrl",
+    rtp2httpd_all: "subscriptionRtp2httpdAllUrl",
+    epg: "subscriptionEpgUrl",
+  };
   Object.entries(ids).forEach(([kind, id]) => { if ($(id)) $(id).value = subscriptionUrl(urls[kind] || ""); });
   const total = Number(data.total_candidates || 0);
   const badge = $("subscriptionCandidateBadge");
@@ -454,6 +460,9 @@ function renderSubscription(data) {
   $("subscriptionSummary").textContent = total
     ? `当前订阅包含 ${total} 个频道，其中回看 ${data.catchup_candidates || 0} 个、FCC ${data.fcc_candidates || 0} 个。主订阅使用固定频道 ID，不暴露运营商 RTSP 或组播源地址。`
     : "当前没有已订阅频道。请到「频道库」勾选频道后加入订阅。";
+  if ($("rtp2httpdSubscriptionSummary")) {
+    $("rtp2httpdSubscriptionSummary").textContent = `rtp2httpd 最佳频道订阅包含 ${data.rtp2httpd_best_count || 0} 个去重后的逻辑频道；全部线路订阅包含 ${data.rtp2httpd_all_count || 0} 条实际线路。两者均直接输出原始 RTP 地址并保留 FCC/FEC。`;
+  }
 }
 
 async function loadSubscription() {
@@ -769,6 +778,7 @@ function collectExportSettings() {
     epg_des_padding: $("epgDesPadding")?.value || "pkcs5",
     epg_stb_type: $("epgStbType")?.value.trim() || "",
     epg_stb_version: $("epgStbVersion")?.value.trim() || "",
+    epg_software_version: $("epgSoftwareVersion")?.value.trim() || "",
     epg_user_agent: $("epgUserAgent")?.value.trim() || "",
     epg_access_user_name: $("epgAccessUserName")?.value.trim() || "",
     pre_export_health_check: $("preExportHealthCheck")?.checked ?? false,
@@ -798,7 +808,7 @@ function scheduleExportSettingsSave() {
 const EXPORT_SETTINGS_TEXT_INPUT_IDS = [
   "httpHost", "httpPort", "rtp2httpdPathPrefix", "catchupDays", "timeshiftHost", "catchupSourceTemplate",
   "iptvPassword", "epgUserId", "epgStbId", "epgDes3Key", "epgAuthHost",
-  "epgStbType", "epgStbVersion", "epgUserAgent", "epgAccessUserName", "catchupAutoRefreshHours",
+  "epgStbType", "epgStbVersion", "epgSoftwareVersion", "epgUserAgent", "epgAccessUserName", "catchupAutoRefreshHours",
 ];
 const EXPORT_SETTINGS_IMMEDIATE_IDS = [
   "pathMode", "fccType", "catchupEnabled", "catchupAutoRefreshEnabled",
@@ -962,13 +972,42 @@ $("clRefreshBtn").addEventListener("click", () => loadChannelList());
 $("clFilterName").addEventListener("input", filterAndRenderChannelList);
 document.querySelectorAll(".copy-subscription-btn").forEach((btn) => btn.addEventListener("click", async () => {
   const key = btn.dataset.subscriptionUrl;
-  const value = $(key === "best" ? "subscriptionBestUrl" : key === "all" ? "subscriptionAllUrl" : key === "hls" ? "subscriptionHlsUrl" : "subscriptionEpgUrl").value;
+  const inputIds = {
+    best: "subscriptionBestUrl",
+    all: "subscriptionAllUrl",
+    hls: "subscriptionHlsUrl",
+    rtp2httpd: "subscriptionRtp2httpdUrl",
+    rtp2httpd_all: "subscriptionRtp2httpdAllUrl",
+    epg: "subscriptionEpgUrl",
+  };
+  const value = $(inputIds[key] || "subscriptionBestUrl").value;
+  const labels = {
+    best: "主订阅", all: "兼容别名", hls: "HLS 兼容订阅",
+    rtp2httpd: "rtp2httpd 最佳频道订阅", rtp2httpd_all: "rtp2httpd 全部线路订阅", epg: "XMLTV EPG",
+  };
+  const status = $("subscriptionCopyStatus");
   try {
-    await navigator.clipboard.writeText(value);
-    const original = btn.textContent;
-    btn.textContent = "已复制";
-    setTimeout(() => { btn.textContent = original; }, 1200);
-  } catch (_) { window.prompt("请复制订阅地址", value); }
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(value);
+    } else {
+      const textarea = document.createElement("textarea");
+      textarea.value = value;
+      textarea.setAttribute("readonly", "");
+      textarea.style.position = "fixed";
+      textarea.style.opacity = "0";
+      document.body.appendChild(textarea);
+      textarea.select();
+      if (!document.execCommand("copy")) throw new Error("浏览器拒绝访问剪贴板");
+      textarea.remove();
+    }
+    status.hidden = false;
+    status.className = "result-box ok compact-result";
+    status.textContent = `已复制${labels[key] || "订阅地址"}。`;
+  } catch (_) {
+    status.hidden = false;
+    status.className = "result-box error compact-result";
+    status.textContent = "复制失败：浏览器未授权剪贴板访问，请检查网页权限后重试。";
+  }
 }));
 $("subscriptionPreviewBtn").addEventListener("click", () => window.open($("subscriptionBestUrl").value, "_blank", "noopener"));
 $("subscriptionDownloadBtn").addEventListener("click", () => {
@@ -990,6 +1029,8 @@ $("backupImportBtn").addEventListener("click", () => {
 });
 
 const BACKUP_MODULES = [
+  ["credentials", "密码与密钥（敏感）"],
+  ["pcap_archives", "历史原始 PCAP 与协议清单（敏感）"],
   ["settings", "应用与导出设置"],
   ["channels", "频道库"],
   ["operator_channels", "运营商频道表"],
@@ -1004,27 +1045,58 @@ let pendingGlobalBackup = null;
 let pendingAuthBackupConflicts = [];
 
 function updateBackupExportConfirmState() {
-  $("backupExportConfirm").disabled = !document.querySelector("#backupExportModules input:checked");
+  const moduleInputs = [...document.querySelectorAll("#backupExportModules input")];
+  const selected = moduleInputs.filter((input) => input.checked).map((input) => input.value);
+  $("backupExportConfirm").disabled = !selected.length;
+  const includeCredentials = Boolean(document.querySelector('#backupExportModules input[value="credentials"]:checked'));
+  const includePcaps = Boolean(document.querySelector('#backupExportModules input[value="pcap_archives"]:checked'));
+  if ($("backupExportAll")) {
+    $("backupExportAll").checked = moduleInputs.length > 0 && selected.length === moduleInputs.length;
+    $("backupExportAll").indeterminate = selected.length > 0 && selected.length < moduleInputs.length;
+  }
+  const summary = $("backupExportSummary");
+  if (summary) {
+    summary.className = `result-box ${includeCredentials || includePcaps ? "warning" : "muted"}`;
+    if (includeCredentials && includePcaps) {
+      summary.textContent = "已选择明文凭据和历史 PCAP：将生成可用于换容器/换机器的迁移 ZIP，请仅保存在可信私有位置。";
+    } else if (includePcaps) {
+      summary.textContent = "已选择历史 PCAP：将生成带 SHA-256 校验的 ZIP；PCAP 可能包含认证流量。";
+    } else if (includeCredentials) {
+      summary.textContent = "已选择“密码与密钥”：IPTV 密码和 DES/DES3 密钥将以明文写入 JSON，请仅保存到可信位置。";
+    } else {
+      summary.textContent = "当前导出轻量 JSON，不包含密码、密钥和原始 PCAP。";
+    }
+  }
 }
 
 function showBackupExportDialog() {
   $("backupExportModules").innerHTML = BACKUP_MODULES.map(([key, label]) => `
     <label class="backup-module-row">
-      <input type="checkbox" value="${escapeHtml(key)}" checked>
+      <input type="checkbox" value="${escapeHtml(key)}" ${key === "credentials" || key === "pcap_archives" ? "" : "checked"}>
       <span>${escapeHtml(label)}</span>
+      ${key === "credentials" ? "<small>以明文写入</small>" : key === "pcap_archives" ? "<small>与协议清单一起写入 ZIP</small>" : ""}
     </label>`).join("");
   $("backupExportModules").querySelectorAll("input").forEach((input) => input.addEventListener("change", updateBackupExportConfirmState));
   updateBackupExportConfirmState();
   $("backupExportDialog").showModal();
 }
 
+$("backupExportAll")?.addEventListener("change", function () {
+  document.querySelectorAll("#backupExportModules input").forEach((input) => { input.checked = this.checked; });
+  updateBackupExportConfirmState();
+});
+
 function backupModuleDetail(key, value) {
-  if (key === "channels" || key === "operator_channels" || key === "discovered_channels" || key === "fcc") {
+  if (key === "operator_channels") {
+    return `${Object.keys(value || {}).length} 条，可能含短期回看 Token`;
+  }
+  if (key === "channels" || key === "discovered_channels" || key === "fcc") {
     return `${Object.keys(value || {}).length} 条`;
   }
   if (key === "iptv_auth_backups") {
     return `${Object.keys(value?.interfaces || {}).length} 个接口`;
   }
+  if (key === "credentials") return "含 IPTV 密码和 DES/DES3 密钥";
   if (key === "channel_snapshots") return `${Object.keys(value || {}).length} 个快照`;
   return "已包含";
 }
@@ -1033,21 +1105,28 @@ function updateBackupRestoreConfirmState() {
   $("backupRestoreConfirm").disabled = !document.querySelector("#backupRestoreModules input:checked");
 }
 
+function confirmTwice(firstMessage, secondMessage) {
+  return confirm(firstMessage) && confirm(secondMessage);
+}
+
 function showBackupRestoreDialog(backup, filename, authConflicts = []) {
   const modules = BACKUP_MODULES.filter(([key]) => backup[key] !== null && backup[key] !== undefined);
   if (!modules.length) throw new Error("不是可恢复的全局备份文件");
   pendingGlobalBackup = backup;
   pendingAuthBackupConflicts = authConflicts;
   const version = backup._app_version ? `，来自 v${backup._app_version}` : "";
-  $("backupRestoreSummary").textContent = `文件：${filename}${version}。请选择要恢复的模块；未勾选的内容不会被修改。`;
+  const schemaVersion = Number(backup.schema_version || backup._version || 1);
+  const legacyNote = backup._legacy_credentials_migrated ? " 已从旧版 settings 中识别出密码或密钥，并作为独立敏感模块等待选择。" : "";
+  $("backupRestoreSummary").textContent = `文件：${filename}${version}，备份格式 v${schemaVersion}。请选择要恢复的模块；未勾选的内容不会被修改。完整恢复回看需要同时选择“应用与导出设置”和“运营商频道表”，恢复后再执行回看刷新。${legacyNote}`;
   $("backupRestoreModules").innerHTML = modules.map(([key, label]) => {
     const hasAuthConflict = key === "iptv_auth_backups" && authConflicts.length > 0;
+    const isSensitive = key === "credentials";
     const detail = hasAuthConflict
       ? `与本机 ${authConflicts.join("、")} 快照冲突，需明确勾选才覆盖`
       : backupModuleDetail(key, backup[key]);
     return `
     <label class="backup-module-row">
-      <input type="checkbox" value="${escapeHtml(key)}" ${hasAuthConflict ? "" : "checked"}>
+      <input type="checkbox" value="${escapeHtml(key)}" ${hasAuthConflict || isSensitive ? "" : "checked"}>
       <span>${escapeHtml(label)}</span>
       <small>${escapeHtml(detail)}</small>
     </label>`;
@@ -1061,6 +1140,29 @@ $("backupImportFile").addEventListener("change", async function () {
   const file = this.files[0];
   if (!file) return;
   const box = $("backupStatus");
+  if (file.name.toLowerCase().endsWith(".zip")) {
+    if (!confirmTwice(
+      "迁移 ZIP 可能覆盖当前设置、频道、认证资料并恢复原始 PCAP。是否继续？",
+      "再次确认：即将校验并恢复完整迁移包，是否执行？",
+    )) return;
+    box.hidden = false; box.className = "result-box warning";
+    box.textContent = "正在校验并恢复备份 ZIP……";
+    const formData = new FormData();
+    formData.append("confirmed", "true"); formData.append("file", file, file.name);
+    try {
+      const resp = await fetch("/api/backup/disaster-import", {method: "POST", body: formData});
+      const body = await resp.json().catch(() => ({}));
+      if (!resp.ok || !body.success) throw new Error(body.error || `恢复失败：${resp.status}`);
+      const result = body.data || {};
+      box.className = "result-box ok";
+      box.textContent = `备份恢复完成：模块 ${(result.restored || []).length} 项，PCAP ${result.pcap_archives_restored || 0} 个，协议清单 ${result.protocol_manifests_restored || 0} 个，已存在且一致的文件 ${result.archive_files_skipped || 0} 个。\n换机器时请再恢复 IPTV 网卡/DHCP/路由，然后执行一次回看刷新。页面将在 3 秒后刷新。`;
+      setTimeout(() => location.reload(), 3000);
+    } catch (err) {
+      box.className = "result-box error";
+      box.textContent = `备份 ZIP 恢复失败：${err.message}`;
+    }
+    return;
+  }
   try {
     const text = await file.text();
     if (file.name.toLowerCase().endsWith(".json")) {
@@ -1118,7 +1220,8 @@ $("backupRestoreForm").addEventListener("submit", async (event) => {
     pendingGlobalBackup = null;
     pendingAuthBackupConflicts = [];
     box.className = "result-box ok";
-    box.textContent = `恢复完成：${result.restored.join("、") || "无"}${result.skipped.length ? `；备份中没有：${result.skipped.join("、")}` : ""}。页面将在 2 秒后刷新。`;
+    const warnings = (result.warnings || []).length ? `\n注意：${result.warnings.join(" ")}` : "";
+    box.textContent = `恢复完成：${result.restored.join("、") || "无"}${result.skipped.length ? `；备份中没有：${result.skipped.join("、")}` : ""}。${warnings}\n页面将在 2 秒后刷新。`;
     loadSavedOperatorCount().catch(() => {});
     loadIptvAuthSummary().catch(() => {});
     setTimeout(() => location.reload(), 2000);
@@ -1144,6 +1247,33 @@ $("backupExportForm").addEventListener("submit", async (event) => {
   const box = $("backupStatus");
   btn.disabled = true;
   try {
+    if (modules.includes("pcap_archives")) {
+      if (!confirmTwice(
+        "所选备份包含原始 PCAP，可能包含 IPTV 认证流量；如同时选中密码与密钥，将以明文保存。是否继续？",
+        "再次确认：即将生成并下载完整迁移备份，请只在可信本地环境保存。是否执行？",
+      )) return;
+      let frame = document.querySelector('iframe[name="migrationBackupDownloadFrame"]');
+      if (!frame) {
+        frame = document.createElement("iframe");
+        frame.name = "migrationBackupDownloadFrame";
+        frame.hidden = true;
+        document.body.appendChild(frame);
+      }
+      const form = document.createElement("form");
+      form.method = "POST"; form.action = "/api/backup/disaster-export";
+      form.target = frame.name; form.hidden = true;
+      const addField = (name, value) => {
+        const input = document.createElement("input");
+        input.type = "hidden"; input.name = name; input.value = value; form.appendChild(input);
+      };
+      addField("confirmed", "true");
+      modules.forEach((module) => addField("modules", module));
+      document.body.appendChild(form); form.submit(); form.remove();
+      $("backupExportDialog").close();
+      box.hidden = false; box.className = "result-box warning";
+      box.textContent = "正在生成迁移备份 ZIP……历史 PCAP 较大时需要等待，下载会自动开始。";
+      return;
+    }
     const resp = await fetch("/api/backup/export", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({modules})});
     if (!resp.ok) {
       const data = await resp.json().catch(() => ({}));
@@ -1164,17 +1294,17 @@ $("backupExportForm").addEventListener("submit", async (event) => {
   } finally { btn.disabled = false; }
 });
 $("backupClearAllBtn")?.addEventListener("click", async () => {
-  const CLEAR_ALL_CONFIRM_TEXT = "确认清除";
-  if (!confirm("将清除全部本地配置：设置、频道列表、运营商频道表、发现的频道、FCC 记录、回看 Token、IPTV 认证备份、频道快照。此操作不可恢复，建议先点「导出到本地」备份。是否继续？")) return;
-  const typed = prompt(`请输入「${CLEAR_ALL_CONFIRM_TEXT}」以确认清除：`);
-  if (typed !== CLEAR_ALL_CONFIRM_TEXT) { alert("确认文本不匹配，已取消。"); return; }
+  if (!confirmTwice(
+    "将清除全部本地配置：设置、频道列表、运营商频道表、发现的频道、FCC 记录、回看 Token、IPTV 认证备份、频道快照。此操作不可恢复，建议先点「导出到本地」备份。是否继续？",
+    "再次确认：所有本地配置即将永久清除，是否执行？",
+  )) return;
   const btn = $("backupClearAllBtn");
   btn.disabled = true; btn.textContent = "清除中…";
   const box = $("backupStatus");
   box.hidden = false; box.className = "result-box warning";
   box.textContent = "正在清除本地配置…";
   try {
-    const result = await requestJson("/api/backup/clear-all", {method: "POST", body: JSON.stringify({confirm: typed})});
+    const result = await requestJson("/api/backup/clear-all", {method: "POST", body: JSON.stringify({confirmed: true})});
     box.className = "result-box ok";
     box.textContent = `已清除：${result.cleared.join("、") || "无"}。页面将在 2 秒后刷新。`;
     setTimeout(() => location.reload(), 2000);
@@ -1288,7 +1418,7 @@ function renderStbDiscoveryStatus(state) {
   if ($("stbDiscoveryPcapBackupBtn")) {
     $("stbDiscoveryPcapBackupBtn").disabled = !latestArchive;
     $("stbDiscoveryPcapBackupBtn").title = latestArchive
-      ? `导出包含原始 PCAP 的本地备份包（共 ${state.archive_count || 1} 份归档）`
+      ? "下载当前选中的 PCAP、对应协议清单和说明"
       : "完成一次 STB 开机捕获后可导出持久化备份";
   }
 
@@ -1324,14 +1454,33 @@ function renderStbDiscoveryArchives(archives) {
   if (!select) return;
   const previous = select.value;
   select.innerHTML = "";
+  const summary = $("stbDiscoveryArchiveSummary");
+  if (summary) {
+    summary.textContent = `${archives?.length || 0} 份`;
+    summary.className = `chip ${archives?.length ? "ok" : "neutral"}`;
+  }
+  if (!archives?.length) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = "暂无历史抓包";
+    select.appendChild(option);
+  }
   for (const archive of archives || []) {
     const option = document.createElement("option");
     option.value = archive.name || "";
     const size = Math.max(0, Number(archive.size || 0));
-    option.textContent = `${archive.name || "未命名抓包"}（${Math.round(size / 1024)} KB）`;
+    const sizeLabel = size >= 1024 * 1024
+      ? `${(size / 1024 / 1024).toFixed(1)} MB`
+      : `${Math.max(1, Math.round(size / 1024))} KB`;
+    const capturedAt = formatDateTime(archive.created_at);
+    option.textContent = `${capturedAt} · ${sizeLabel}${archive.has_manifest ? " · 含协议清单" : ""}`;
+    option.title = archive.name || "";
     select.appendChild(option);
   }
   select.disabled = !archives?.length;
+  if ($("stbDiscoveryArchiveDeleteBtn")) {
+    $("stbDiscoveryArchiveDeleteBtn").disabled = !archives?.length;
+  }
   if (previous && [...select.options].some((option) => option.value === previous)) {
     select.value = previous;
   }
@@ -1485,6 +1634,34 @@ $("stbDiscoveryPcapBackupBtn")?.addEventListener("click", () => {
   document.body.removeChild(a);
 });
 
+$("stbDiscoveryArchiveDeleteBtn")?.addEventListener("click", async () => {
+  const select = $("stbDiscoveryArchiveSelect");
+  const archive = select?.value || "";
+  if (!archive) return;
+  const label = select.selectedOptions?.[0]?.textContent || archive;
+  if (!confirmTwice(
+    `将永久删除选中的原始 PCAP 及其协议清单：\n${label}\n\n此操作不可恢复，是否继续？`,
+    `再次确认：即将永久删除 ${label}，是否执行？`,
+  )) return;
+  const btn = $("stbDiscoveryArchiveDeleteBtn");
+  const status = $("stbDiscoveryArchiveStatus");
+  btn.disabled = true;
+  status.hidden = false; status.className = "result-box warning compact-result";
+  status.textContent = "正在删除选中抓包……";
+  try {
+    const result = await requestJson(`/api/stb_discovery/archives/${encodeURIComponent(archive)}`, {
+      method: "DELETE", body: JSON.stringify({confirmed: true}),
+    });
+    status.className = "result-box ok compact-result";
+    status.textContent = `已删除 ${result.name}${result.artifacts_deleted ? " 及对应协议清单" : ""}。`;
+    await loadStbDiscoveryState();
+  } catch (err) {
+    status.className = "result-box error compact-result";
+    status.textContent = `删除失败：${err.message}`;
+    btn.disabled = false;
+  }
+});
+
 // ── catchup-source mode UI ────────────────────────────────────────────────
 
 function updateCatchupSourceUI() {
@@ -1533,13 +1710,15 @@ $("refreshBacktvBtn")?.addEventListener("click", async () => {
       epg_des_padding: $("epgDesPadding")?.value || "pkcs5",
       epg_stb_type: $("epgStbType")?.value.trim() || "",
       epg_stb_version: $("epgStbVersion")?.value.trim() || "",
+      epg_software_version: $("epgSoftwareVersion")?.value.trim() || "",
       epg_user_agent: $("epgUserAgent")?.value.trim() || "",
       epg_access_user_name: $("epgAccessUserName")?.value.trim() || "",
     })});
     alert(`回看地址刷新完成：更新 ${result.updated} / ${result.total} 个频道（EPG：${result.epg_host}，模式：${result.profile || "auto"}）`);
     await loadCatchupAutoRefreshStatus();
   } catch (err) {
-    alert("刷新失败：" + err.message);
+    const message = String(err.message || "请求失败");
+    alert(message.startsWith("刷新失败") ? message : "刷新失败：" + message);
   } finally {
     btn.textContent = orig;
     btn.disabled = false;
@@ -1630,7 +1809,6 @@ function _renderIptvTcStatus(d) {
   ];
   status.innerHTML = lines.map(line => `<div>${line}</div>`).join("");
   status.className = "result-box " + (suspected || hasBpf ? "warning" : "ok");
-  if (!$("iptvTcConfirm").placeholder && d.confirmation_text) $("iptvTcConfirm").placeholder = d.confirmation_text;
 }
 
 async function refreshIptvTcStatus() {
@@ -1671,7 +1849,6 @@ function _renderIptvTcWatch(data) {
   ].filter(Boolean);
   status.innerHTML = lines.map(line => `<div>${line}</div>`).join("");
   status.className = "result-box " + (runtime.last_error ? "error" : enabled ? "ok" : "muted");
-  if (!$("iptvTcWatchConfirm").placeholder && data.confirmation_text) $("iptvTcWatchConfirm").placeholder = data.confirmation_text;
 }
 
 async function refreshIptvTcWatchStatus() {
@@ -1690,6 +1867,10 @@ async function saveIptvTcWatch() {
   const iface = $("iptvAuthIface").value || $("stbDiscoveryIface").value;
   const enabled = $("iptvTcAutoFix").checked;
   if (enabled && !iface) { alert("请先选择 IPTV 上游接口。"); return; }
+  if (enabled && !confirmTwice(
+    "开启后将持续检查选定网口，并在命中条件时自动解除 egress BPF。是否继续？",
+    "再次确认：即将开启 egress BPF 自动修复，是否执行？",
+  )) return;
   const btn = $("iptvTcWatchSaveBtn");
   btn.disabled = true; btn.textContent = "保存中…";
   try {
@@ -1697,7 +1878,7 @@ async function saveIptvTcWatch() {
       enabled,
       interface: iface,
       interval_seconds: Number($("iptvTcWatchInterval").value || 30),
-      confirm: $("iptvTcWatchConfirm").value.trim(),
+      confirmed: enabled,
     };
     const d = await requestJson("/api/iptv-auth/egress-bpf/watch", {
       method: "POST",
@@ -1734,7 +1915,10 @@ async function refreshIptvAuthStatus() {
 async function clearIptvEgressBpf() {
   const iface = $("iptvAuthIface").value || $("stbDiscoveryIface").value;
   if (!iface) { alert("请先选择 IPTV 上游接口。"); return; }
-  const confirmText = $("iptvTcConfirm").value.trim();
+  if (!confirmTwice(
+    `将临时解除 ${iface} 的 egress BPF 过滤器，并保存执行前快照。是否继续？`,
+    `再次确认：即将修改 ${iface} 的流量控制设置，是否执行？`,
+  )) return;
   const btn = $("iptvTcFixBtn");
   btn.disabled = true; btn.textContent = "解除中…";
   $("iptvTcStatus").textContent = "正在临时解除选定接口的 egress BPF，并保存检测快照…";
@@ -1742,7 +1926,7 @@ async function clearIptvEgressBpf() {
   try {
     const d = await requestJson("/api/iptv-auth/egress-bpf/clear", {
       method: "POST",
-      body: JSON.stringify({interface: iface, confirm: confirmText}),
+      body: JSON.stringify({interface: iface, confirmed: true}),
     });
     const after = d.after || {};
     _renderIptvTcStatus(after);
@@ -1761,12 +1945,17 @@ async function clearIptvEgressBpf() {
 }
 
 async function applyIptvAuth() {
+  const iface = $("iptvAuthIface").value || $("stbDiscoveryIface").value;
+  if (!confirmTwice(
+    `实验性一键认证将修改 ${iface || "选定网口"} 的 MAC、IPv4 地址和 IPTV 路由。请确保当前管理连接不依赖该网口。是否继续？`,
+    "再次确认：即将执行 IPTV 网卡认证和路由变更，是否执行？",
+  )) return;
   const btn = $("iptvAuthApplyBtn");
   btn.disabled = true; btn.textContent = "执行中…";
   $("iptvAuthApplyResult").textContent = "正在执行认证，请不要断开当前管理网络…";
   $("iptvAuthApplyResult").className = "result-box warning";
   try {
-    const payload = {..._iptvAuthPayload(), confirm: $("iptvAuthConfirm").value.trim()};
+    const payload = {..._iptvAuthPayload(), confirmed: true};
     const d = await requestJson("/api/iptv-auth/apply", {method: "POST", body: JSON.stringify(payload)});
     const ips = (d.snapshot?.ipv4 || []).map(x => `${x.local}/${x.prefixlen}`).join(", ") || "无 IPv4";
     const mcastOk = d.snapshot?.has_multicast_route;
@@ -1784,10 +1973,15 @@ async function applyIptvAuth() {
 }
 
 async function restoreIptvAuth() {
+  const iface = $("iptvAuthIface").value;
+  if (!confirmTwice(
+    `将把 ${iface || "选定网口"} 恢复到执行 IPTV 认证前的初始状态。是否继续？`,
+    "再次确认：即将恢复网口地址与路由设置，是否执行？",
+  )) return;
   const btn = $("iptvAuthRestoreBtn");
   btn.disabled = true; btn.textContent = "恢复中…";
   try {
-    const payload = {interface: $("iptvAuthIface").value, confirm: $("iptvAuthRestoreConfirm").value.trim()};
+    const payload = {interface: iface, confirmed: true};
     const d = await requestJson("/api/iptv-auth/restore", {method: "POST", body: JSON.stringify(payload)});
     const ips = (d.snapshot?.ipv4 || []).map(x => `${x.local}/${x.prefixlen}`).join(", ") || "无 IPv4";
     $("iptvAuthApplyResult").textContent = `已恢复：${d.interface} 当前 IPv4：${ips}`;

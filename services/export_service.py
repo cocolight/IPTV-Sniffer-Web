@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import csv
+import io
 import json
 import re
 from pathlib import Path
@@ -247,6 +248,43 @@ class ExportService:
             best.append(primary)
         best.sort(key=self._channel_sort_key)
         return best
+
+    def source_subscription_m3u(
+        self,
+        rows: list[dict[str, Any]],
+        settings: dict[str, Any],
+        *,
+        best_only: bool,
+    ) -> tuple[str, int]:
+        """Build a live rtp2httpd source subscription without proxy URLs.
+
+        The URL format is intentionally independent from the player's stable
+        ``/live`` subscription.  The caller still filters rows through the
+        owner's subscription selection, while rtp2httpd receives the original
+        multicast URLs so it cannot recursively proxy back into this app.
+        """
+        channels = self._normalize_channels(rows)
+        if best_only:
+            channels = self._select_best_channels(channels)
+        epg_url = str(settings.get("epg_url") or "").strip() if settings.get("use_epg", True) else ""
+        fcc_type = str(settings.get("fcc_type") or "").strip()
+        handle = io.StringIO(newline="\n")
+        if epg_url:
+            handle.write(f'#EXTM3U x-tvg-url="{epg_url.replace(chr(34), "%22")}"\n')
+        else:
+            handle.write("#EXTM3U\n")
+        for channel in channels:
+            self._write_m3u_item(
+                handle,
+                channel,
+                channel.category,
+                "",
+                0,
+                "rtp",
+                "source",
+                fcc_type=fcc_type,
+            )
+        return handle.getvalue(), len(channels)
 
     def _write_m3u(
         self,

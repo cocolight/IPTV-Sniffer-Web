@@ -1,14 +1,14 @@
 # IPTV Sniffer Web
 
-当前稳定版本：`v1.3.2`
+当前稳定版本：`v1.3.3`
 
 面向飞牛 NAS、Linux Docker 和交换机镜像口场景的 IPTV 频道发现、订阅管理与播放工作台。它捕获机顶盒开机流量，将频道加入订阅，并提供可长期固定使用的播放器订阅地址。
 
 ### 原始抓包归档与备份
 
-每次完成机顶盒开机捕获后，原始 PCAP 会持久保存到数据卷的 `stb-captures/` 目录；容器重启、重新部署或网页重置都不会删除它。频道发现页可导出最近一份原始 PCAP，也可下载包含原始 PCAP、脱敏协议清单和说明的 ZIP 备份包，供日后离线重新解析。
+每次完成机顶盒开机捕获后，原始 PCAP 会持久保存到数据卷的 `stb-captures/` 目录；容器重启、重新部署或网页重置都不会删除它。频道发现页可按时间、大小与协议清单状态查看历史抓包，下载原始 PCAP 或单份备份包，也可经二次确认删除选中 PCAP 及对应协议清单。
 
-PCAP 可能包含认证报文，因此不会纳入普通 JSON 配置备份，也不会通过状态接口或应用日志展示。请只保存在受信任的本地存储中。
+PCAP 可能包含认证报文，因此默认不会纳入轻量 JSON 备份，也不会通过状态接口或应用日志展示。需要换容器或换机器时，在统一备份对话框中点“全选（完整迁移）”，即可一次保存全部状态、凭据、原始 PCAP 和协议清单。请只保存在受信任的本地存储中。
 
 > 仅在你有权使用的网络和 IPTV 服务中部署。镜像口用于被动捕获，不能替代具备 IPTV 上游访问能力的播放设备。
 
@@ -39,7 +39,7 @@ docker run -d \
   -e TZ=Asia/Shanghai \
   -v $(pwd)/data:/app/data \
   -v $(pwd)/output:/app/output \
-  roninriddle/iptv-sniffer-web:1.3.2
+  roninriddle/iptv-sniffer-web:1.3.3
 ```
 
 访问 `http://宿主机IP:8787`。
@@ -81,7 +81,7 @@ pytest -q
 2. 在「运营商频道」选择镜像网口、填写机顶盒 IP，开始捕获后重启机顶盒，再导入发现的频道。
 3. 打开「订阅中心」；首次升级会自动把原有最佳频道加入订阅。到「频道库」勾选频道后，可加入或移出订阅。
 4. 播放器优先使用固定的 `http://宿主机IP:8787/playlist.m3u`。需要兼容 HLS 时使用 `/playlist-hls.m3u`，XMLTV 使用 `/epg.xml`。这些地址不包含组播、RTSP、FCC 或认证材料。
-5. 仅在需要离线副本或供 `rtp2httpd` 读取时，到「订阅中心 → 高级设置 / 静态导出」生成文件；未临时勾选频道库条目时，静态文件默认按已订阅频道导出。
+5. `rtp2httpd` 优先直接订阅 `/playlist-rtp2httpd.m3u`（最佳频道）或 `/playlist-rtp2httpd-all.m3u`（全部线路）；仅在需要离线副本时再到「订阅中心 → 高级设置 / 静态导出」生成文件。
 6. 需要主动播放时，在「IPTV 认证」先查看捕获到的认证摘要；确认网络隔离与回退方案后，才使用实验性一键认证。
 7. 播放异常时，在「播放诊断」填写 `rtp2httpd` 地址和频道地址，依次检查上游认证、IGMP、FCC 和组播回流。
 
@@ -92,6 +92,8 @@ pytest -q
 | `/playlist.m3u` | 推荐的动态主订阅，使用稳定的 `/live/<频道ID>` 与 `/catchup/<频道ID>`。 |
 | `/playlist-all.m3u` | 与主订阅内容相同的兼容别名；保留给已保存该地址的播放器配置。 |
 | `/playlist-hls.m3u` | 将直播入口改为本机 HLS 兼容地址。 |
+| `/playlist-rtp2httpd.m3u` | 每个逻辑频道选择一条最佳线路，直接输出原始 `rtp://` 地址及 FCC/FEC 参数。 |
+| `/playlist-rtp2httpd-all.m3u` | 输出频道库中的全部实际线路，适合由 rtp2httpd 自行管理来源。 |
 | `/epg.xml` | 已配置的 XMLTV EPG 订阅源。 |
 
 默认端口为 `8787`，例如播放器填写 `http://192.168.3.6:8787/playlist.m3u`。如果部署时显式设置了 `WEB_PORT=8788`，则相应改为 `http://192.168.3.6:8788/playlist.m3u`。频道组播地址发生变化时，应用以运营商频道表中的当前记录更新内部转发目标，播放器不需要重新导入订阅。
@@ -103,19 +105,33 @@ pytest -q
 「导入频道 / 恢复备份」是统一入口：
 
 - 全局备份可按频道库、运营商频道表、认证快照和设置等模块选择恢复，并兼容旧版备份与单接口认证备份；
+- 普通“应用与导出设置”备份不含 IPTV 密码或 DES/DES3 密钥；“密码与密钥（敏感）”默认不选，主动选择后才以明文写入；
+- 旧版 `settings` 中的密码和密钥会在导入检查阶段迁移为独立敏感模块，未选择该模块时不会修改或清空本机凭据；
+- 完整恢复回看应依次恢复应用设置和运营商频道表，再执行一次回看刷新；备份中的回看 Token 可能已经过期；
 - 可导入本应用先前导出的播放器 M3U、`rtp2httpd` 源 M3U，以及 `channels.json`，用于恢复频道库；
 - 恢复认证快照时，如果本机存在同名接口，默认不覆盖；请先确认接口和网络状态再手动处理。
+
+备份对话框中，密码/密钥与历史 PCAP 默认不选。更换容器或机器时，点顶部“全选（完整迁移）”导出迁移 ZIP：
+
+- ZIP 包含全部普通备份模块、明文 IPTV 密码与 DES/DES3 密钥、所有已归档 PCAP、脱敏协议清单、部署说明及 SHA-256 校验清单；
+- 只有选中历史 PCAP 时才生成 ZIP，未选 PCAP 时仍导出轻量 JSON；导出与 ZIP 恢复都会连续弹出两次确认，无需输入确认文本；
+- ZIP 恢复前会校验所有文件，拒绝额外路径、损坏内容及同名不同内容的 PCAP；
+- 已存在且校验值相同的 PCAP 会安全跳过，新文件以仅容器用户可读写权限落盘；
+- 灾备包不包含 Docker 镜像、应用日志、HLS 临时文件、EPG 缓存、运行中的 DHCP 进程及 Cookie/JSESSIONID；
+- 新宿主机仍需使用 host 网络、`NET_ADMIN` / `NET_RAW`，将专用 IPTV 网卡设为 NetworkManager 不托管，并恢复 IPTV DHCP 认证与路由。完成后只需刷新回看，无需再让机顶盒重新开机抓包。
 
 导入仅接受 IPv4 组播来源。不要把来源不明的备份或播放列表直接用于实验性认证操作。
 
 ## `rtp2httpd` 配置示例
 
-`rtp2httpd` 默认端口为 `5140`。将导出的源文件保存到 rtp2httpd 可访问的位置，再配置：
+`rtp2httpd` 默认端口为 `5140`。建议直接订阅应用提供的动态原始源列表：
 
 ```ini
-external-m3u = file:///vol1/@appshare/rtp2httpd/channels-rtp2httpd-best.m3u
-external-m3u-update-interval = 0
+external-m3u = http://iptv-sniffer-host:8787/playlist-rtp2httpd.m3u
+external-m3u-update-interval = 300
 ```
+
+若需要保留每个逻辑频道的所有备选线路，将地址改为 `/playlist-rtp2httpd-all.m3u`。这两个入口禁止缓存，并且不会输出可能导致递归代理的本站 `/live/` 地址。
 
 常见播放地址形态：
 
@@ -152,9 +168,13 @@ http://rtp2httpd-host:5140/rtp/239.x.x.x:port
 | `POST` | `/api/stb_discovery/import` | 导入发现到的运营商频道。 |
 | `POST` | `/api/channels/import-export` | 导入已导出的 M3U 或 `channels.json`。 |
 | `POST` | `/api/iptv-auth/backup-import` | 恢复接口认证备份。 |
+| `POST` | `/api/backup/disaster-export` | 导出包含凭据与原始 PCAP 的完整灾备 ZIP。 |
+| `POST` | `/api/backup/disaster-import` | 校验并恢复完整灾备 ZIP。 |
 | `POST` | `/api/export` | 导出频道文件。 |
 | `GET` | `/api/subscription` | 读取订阅频道清单和固定订阅入口。 |
 | `POST` | `/api/subscription/candidates` | 加入、移出或重置已订阅频道。 |
+| `GET` | `/playlist-rtp2httpd.m3u` | rtp2httpd 最佳频道原始 RTP 订阅。 |
+| `GET` | `/playlist-rtp2httpd-all.m3u` | rtp2httpd 全部实际线路订阅。 |
 | `POST` | `/api/diagnose` | 执行播放链路诊断。 |
 | `POST` | `/api/catchup/refresh` | 刷新回看地址。 |
 
@@ -169,6 +189,7 @@ http://rtp2httpd-host:5140/rtp/239.x.x.x:port
 
 | 版本 | 更新摘要 |
 | --- | --- |
+| `v1.3.3` | 增加可删除历史 PCAP 及协议清单的管理功能；完整灾备纳入原始抓包与敏感凭据的可选迁移；所有原“输入指定文本确认”改为连续两次弹窗确认；新增 rtp2httpd 最佳频道与全部线路的原始 RTP 动态订阅。 |
 | `v1.3.2` | 重构频道库为单一平铺视图：分类、订阅状态与 FCC / 回看 / 时移 / 4K 快捷筛选；直接显示 HD / 4K、能力与订阅状态；移除分组页面并收敛批量操作。 |
 | `v1.3.1` | 修正订阅别名语义：`/playlist-all.m3u` 明确为主订阅兼容别名；订阅清单纳入全局备份、恢复与清除；回看入口统一为稳定 `/catchup/<频道ID>`；时移长度统一使用分钟字段并兼容旧数据。 |
 | `v1.3.0–v1.2.0` | 建立从机顶盒抓包、频道发现、认证辅助、频道导入与备份恢复，到稳定动态订阅、直播 / FCC / 回看 / 时移、HLS、EPG、播放诊断的一体化工作流；覆盖联通、北京联通与电信频道表适配，支持原始 PCAP 归档和回归测试。 |

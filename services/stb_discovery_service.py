@@ -968,6 +968,7 @@ def _extract_epg_credentials(streams: dict[Any, bytes], stb_ip: str) -> dict[str
             for source, destination in (
                 ("STBType", "epg_stb_type"),
                 ("STBVersion", "epg_stb_version"),
+                ("SoftwareVersion", "epg_software_version"),
                 ("NetUserID", "epg_net_user_id"),
                 ("conntype", "epg_conn_type"),
                 ("Lang", "epg_lang"),
@@ -1336,6 +1337,28 @@ class StbDiscoveryService:
                 "has_manifest": (self.archive_dir / f"{path.stem}.artifacts" / "manifest.json").is_file(),
             })
         return sorted(result, key=lambda item: (item["created_at"], item["name"]), reverse=True)
+
+    def delete_archive(self, name: str) -> dict[str, Any]:
+        """Delete one explicitly selected persisted capture and its metadata."""
+        path = self.archive_path(name)
+        if path is None:
+            raise FileNotFoundError("历史抓包不存在")
+        size = path.stat().st_size
+        artifact_dir = path.parent / f"{path.stem}.artifacts"
+        path.unlink()
+        artifacts_deleted = False
+        if artifact_dir.is_dir():
+            shutil.rmtree(artifact_dir)
+            artifacts_deleted = True
+        with self._lock:
+            if self._state.get("archived_pcap") == path.name:
+                self._state["archived_pcap"] = ""
+                self._state["protocol_artifacts"] = {"saved": False}
+        return {
+            "name": path.name,
+            "size": size,
+            "artifacts_deleted": artifacts_deleted,
+        }
 
     def latest_archive_path(self) -> Path | None:
         archives = self.list_archives()

@@ -133,13 +133,24 @@
               <button id="stbDiscoveryStopBtn" class="secondary" type="button" disabled>停止 &amp; 分析</button>
               <button id="refreshInterfacesBtn" class="secondary" type="button">刷新网卡</button>
               <button id="stbDiscoveryResetBtn" class="secondary" type="button">重置</button>
-              <select id="stbDiscoveryArchiveSelect" aria-label="选择已归档抓包" disabled>
-                <option value="">最新归档</option>
-              </select>
-              <button id="stbDiscoveryPcapBtn" class="secondary" type="button" disabled>导出原始 PCAP</button>
-              <button id="stbDiscoveryPcapBackupBtn" class="secondary" type="button" disabled>导出 PCAP 备份 ZIP</button>
             </div>
             <div id="stbDiscoveryStatus" class="result-box muted">等待开始…</div>
+            <div class="archive-panel mt-12">
+              <div class="section-title compact-title">
+                <h3>历史抓包归档</h3>
+                <span id="stbDiscoveryArchiveSummary" class="chip neutral">0 份</span>
+              </div>
+              <p class="field-hint">这里显示当前数据卷 <code>/app/data/stb-captures</code> 中保留的原始抓包；它们可能来自本机历史捕获，也可能由迁移备份恢复。重启或更换容器不会自动删除。</p>
+              <div class="form-actions">
+                <select id="stbDiscoveryArchiveSelect" aria-label="选择历史抓包" disabled>
+                  <option value="">暂无历史抓包</option>
+                </select>
+                <button id="stbDiscoveryPcapBtn" class="secondary" type="button" disabled>下载选中 PCAP</button>
+                <button id="stbDiscoveryPcapBackupBtn" class="secondary" type="button" disabled>下载选中抓包包</button>
+                <button id="stbDiscoveryArchiveDeleteBtn" class="danger" type="button" disabled>删除选中抓包</button>
+              </div>
+              <div id="stbDiscoveryArchiveStatus" class="result-box muted compact-result" hidden></div>
+            </div>
           </section>
 
           <section class="card">
@@ -159,11 +170,11 @@
               <h2>导入与全局备份</h2>
               <span class="muted small">支持导入频道、备份、设置、认证与快照</span>
             </div>
-            <p class="task-description">可导入本应用之前导出的 M3U 或 channels.json 频道列表；选择全局备份 JSON 时，可按需恢复频道、设置、认证与快照等模块。</p>
+            <p class="task-description">从同一个入口选择需要备份或恢复的模块；只有选中原始 PCAP 时才生成 ZIP，其余情况保持为轻量 JSON。</p>
             <div class="button-row">
               <button id="backupExportBtn" class="secondary" type="button">导出到本地</button>
               <button id="backupImportBtn" class="secondary" type="button">导入频道 / 恢复备份</button>
-              <input id="backupImportFile" type="file" accept=".m3u,.m3u8,.json,application/json,audio/x-mpegurl,application/vnd.apple.mpegurl" class="hidden-control">
+              <input id="backupImportFile" type="file" accept=".m3u,.m3u8,.json,.zip,application/json,application/zip,audio/x-mpegurl,application/vnd.apple.mpegurl" class="hidden-control">
               <button id="backupClearAllBtn" class="danger" type="button">清除所有配置</button>
             </div>
             <div id="backupStatus" class="result-box muted" hidden></div>
@@ -259,14 +270,7 @@
             </div>
             <p class="task-description">一键认证仅操作上方选择的接口：保存初始快照 → 清空该接口 IPv4 → 克隆 STB MAC → 发送 Hostname/Option60 DHCP 请求 → 按路由策略写入 IPTV 路由。恢复会清空该接口 IPv4 与路由，并按首次备份恢复 MAC、IPv4 和路由。</p>
             <div class="form-grid">
-              <label>
-                执行确认文本
-                <input id="iptvAuthConfirm" type="text" placeholder="确认执行">
-              </label>
-              <label>
-                恢复确认文本
-                <input id="iptvAuthRestoreConfirm" type="text" placeholder="确认恢复">
-              </label>
+              <p class="muted">执行认证或恢复网卡前，页面会连续弹出两次确认，无需输入确认文本。</p>
             </div>
             <div class="button-row">
               <button id="iptvAuthApplyBtn" class="danger-btn" type="button">实验性一键认证</button>
@@ -279,10 +283,7 @@
             </div>
             <p class="task-description">当 rtp2httpd 日志显示 FCC 成功但切换组播后无数据时，可检测选定 IPTV 网口是否存在 egress BPF/TC 过滤器拦截 IGMP。临时解除只操作当前接口，执行前会保存检测快照。</p>
             <div class="form-grid compact-grid">
-              <label>
-                解除确认文本
-                <input id="iptvTcConfirm" type="text" placeholder="确认解除">
-              </label>
+              <p class="muted">临时解除前会连续弹出两次确认。</p>
               <div class="button-row align-self-end">
                 <button id="iptvTcRefreshBtn" class="secondary" type="button">检测组播拦截</button>
                 <button id="iptvTcFixBtn" class="danger-btn" type="button">临时解除 egress BPF</button>
@@ -303,10 +304,7 @@
                 检测间隔（秒）
                 <input id="iptvTcWatchInterval" type="number" min="10" max="3600" step="5" value="30">
               </label>
-              <label>
-                开启确认文本
-                <input id="iptvTcWatchConfirm" type="text" placeholder="确认恢复">
-              </label>
+              <p class="muted">开启自动修复前会连续弹出两次确认；关闭时直接保存。</p>
               <div class="button-row align-self-end">
                 <button id="iptvTcWatchSaveBtn" class="secondary" type="button">保存自动修复</button>
                 <button id="iptvTcWatchRefreshBtn" class="secondary" type="button">刷新守护状态</button>
@@ -344,11 +342,21 @@
                 <div class="copy-field"><input id="subscriptionHlsUrl" class="mono" type="text" readonly><button class="secondary copy-subscription-btn" data-subscription-url="hls" type="button">复制</button></div>
               </label>
               <label>
+                rtp2httpd 最佳频道订阅
+                <div class="copy-field"><input id="subscriptionRtp2httpdUrl" class="mono" type="text" readonly><button class="secondary copy-subscription-btn" data-subscription-url="rtp2httpd" type="button">复制</button></div>
+              </label>
+              <label>
+                rtp2httpd 全部线路订阅
+                <div class="copy-field"><input id="subscriptionRtp2httpdAllUrl" class="mono" type="text" readonly><button class="secondary copy-subscription-btn" data-subscription-url="rtp2httpd_all" type="button">复制</button></div>
+              </label>
+              <label>
                 XMLTV EPG
                 <div class="copy-field"><input id="subscriptionEpgUrl" class="mono" type="text" readonly><button class="secondary copy-subscription-btn" data-subscription-url="epg" type="button">复制</button></div>
               </label>
             </div>
+            <div id="subscriptionCopyStatus" class="result-box muted compact-result" hidden></div>
             <div id="subscriptionSummary" class="result-box muted compact-result">正在读取订阅频道…</div>
+            <div id="rtp2httpdSubscriptionSummary" class="result-box muted compact-result">rtp2httpd 专用订阅直接输出原始 RTP 地址，不经过本站直播代理。</div>
             <div class="button-row mt-8">
               <button id="subscriptionPreviewBtn" class="primary" type="button">预览主订阅</button>
               <button id="subscriptionDownloadBtn" class="secondary" type="button">下载当前静态副本</button>
@@ -448,6 +456,10 @@
             </div>
             <div id="catchupSettingsBlock" style="display:none">
               <div class="notice compact">
+                <strong>可信内网管理页面：</strong>
+                <span>密码和密钥会在本页明文显示，但不会写入 URL、普通设置备份或应用日志。请勿将管理页面暴露到不可信网络。</span>
+              </div>
+              <div class="notice compact">
                 <strong>工作方式：</strong>
                 <span>频道表导入时记录运营商提供的 TimeShiftLength（分钟）与 backtv_url；动态订阅中的播放器访问稳定 <code>/catchup/&lt;频道ID&gt;</code>，服务端再解析当前回看地址与合法认证状态。联通 HWCU 优先使用兼容 STB 的 RTSP/UDP 会话；其他平台按兼容链路处理。回看服务器在 IPTV 子网，需完成 IPTV 认证后才可访问。</span>
               </div>
@@ -518,7 +530,7 @@
                 </label>
                 <label>
                   IPTV 密码
-                  <input id="iptvPassword" type="password" autocomplete="current-password" placeholder="运营商 IPTV 业务密码">
+                  <input id="iptvPassword" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="运营商 IPTV 业务密码">
                 </label>
                 <label>
                   用户ID（UserID）
@@ -530,8 +542,8 @@
                 </label>
                 <label>
                   DES / DES3 加密密钥
-                  <input id="epgDes3Key" type="password" autocomplete="new-password" maxlength="24" placeholder="8 / 16 / 24 位密钥；保存后不会再次显示">
-                  <small id="epgDes3KeyStatus">仅保存在本机数据卷，不包含在 JSON 全局备份中。</small>
+                  <input id="epgDes3Key" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="24" placeholder="8 / 16 / 24 位密钥">
+                  <small id="epgDes3KeyStatus">以明文显示在本机管理页面；导出备份时可单独选择是否包含。</small>
                 </label>
                 <label style="grid-column: 1 / -1">
                   EPG 认证服务器（留空自动检测）
@@ -544,6 +556,10 @@
                 <label>
                   STBVersion
                   <input id="epgStbVersion" type="text" autocomplete="off" placeholder="抓包自动提取，CTC-HWCTC 必填">
+                </label>
+                <label>
+                  SoftwareVersion
+                  <input id="epgSoftwareVersion" type="text" autocomplete="off" placeholder="抓包自动提取，运营商校验时使用">
                 </label>
                 <label>
                   AccessUserName
@@ -758,7 +774,12 @@
       <div class="section-title">
         <h2 id="backupExportTitle">选择要备份的模块</h2>
       </div>
-      <div class="result-box muted">默认已全选。生成的是同一种全局备份文件，可在恢复时再次选择其中的模块。</div>
+      <label class="backup-module-row backup-select-all-row">
+        <input id="backupExportAll" type="checkbox">
+        <span>全选（完整迁移）</span>
+        <small>全选后可用于更换容器或机器，恢复配置、凭据与历史 PCAP，无需重新抓包。</small>
+      </label>
+      <div id="backupExportSummary" class="result-box muted">常规模块默认已选；“密码与密钥”和“历史原始 PCAP”默认不选。</div>
       <div id="backupExportModules" class="backup-module-list"></div>
       <div class="dialog-actions">
         <button id="backupExportSelectAll" class="secondary" type="button">全选</button>

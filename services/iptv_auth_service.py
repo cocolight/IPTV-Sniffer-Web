@@ -18,12 +18,6 @@ from config import APP_VERSION
 from services.log_service import AppLogger
 
 
-CONFIRM_TEXT = "确认执行"
-RESTORE_CONFIRM_TEXT = "确认恢复"
-BPF_CLEAR_CONFIRM_TEXT = "确认解除"
-BPF_AUTO_FIX_CONFIRM_TEXT = "确认恢复"
-
-
 def _safe_load_json(path: Path, default: Any) -> Any:
     if not path.exists():
         return default
@@ -392,8 +386,6 @@ exit 0
             "auth_ready": has_auth,
             "has_iptv_ip": has_iptv_ip,
             "backup": self.backup_summary(iface),
-            "confirm_text": CONFIRM_TEXT,
-            "restore_confirm_text": RESTORE_CONFIRM_TEXT,
         }
 
     def _capability_enabled(self, cap_number: int) -> bool:
@@ -408,9 +400,8 @@ exit 0
             return False
 
     def apply(self, data: dict[str, Any], auth_info: dict[str, Any] | None = None) -> dict[str, Any]:
-        confirm = str(data.get("confirm") or "").strip()
-        if confirm != CONFIRM_TEXT:
-            raise ValueError(f"请输入确认文本：{CONFIRM_TEXT}")
+        if data.get("confirmed") is not True:
+            raise ValueError("请在页面完成两次确认后再执行")
         p = self._payload(data, auth_info)
         iface = p["interface"]
         if not self._interface_exists(iface):
@@ -525,9 +516,8 @@ exit 0
         return {"interface": iface, "payload": p, "snapshot": snap, "steps": steps, "backup": self.backup_summary(iface)}
 
     def restore(self, data: dict[str, Any]) -> dict[str, Any]:
-        confirm = str(data.get("confirm") or "").strip()
-        if confirm != RESTORE_CONFIRM_TEXT:
-            raise ValueError(f"请输入确认文本：{RESTORE_CONFIRM_TEXT}")
+        if data.get("confirmed") is not True:
+            raise ValueError("请在页面完成两次确认后再恢复")
         iface = _valid_iface(data.get("interface") or "")
         entry = self._backup_data().get("interfaces", {}).get(iface) or {}
         initial = entry.get("initial")
@@ -662,7 +652,6 @@ exit 0
             "handle_egress_present": handle_egress_present,
             "egress_pref": pref or "49152",
             "suspected_igmp_block": suspected,
-            "confirmation_text": BPF_CLEAR_CONFIRM_TEXT,
             "command_preview": f"tc filter del dev {iface} egress protocol all pref {pref or '49152'}",
             "link": link,
             "qdisc": qdisc,
@@ -671,9 +660,8 @@ exit 0
 
     def clear_egress_bpf(self, data: dict[str, Any]) -> dict[str, Any]:
         """Temporarily remove the selected interface's egress BPF filter."""
-        confirm = str(data.get("confirm") or "").strip()
-        if confirm != BPF_CLEAR_CONFIRM_TEXT:
-            raise ValueError(f"请输入确认文本：{BPF_CLEAR_CONFIRM_TEXT}")
+        if data.get("confirmed") is not True:
+            raise ValueError("请在页面完成两次确认后再解除")
         iface = _valid_iface(data.get("interface") or "")
         before = self.egress_bpf_status(iface)
         if not before["tools"]["tc"]:
@@ -731,7 +719,6 @@ exit 0
         return {
             "config": self._bpf_watch_config(),
             "runtime": runtime,
-            "confirmation_text": BPF_AUTO_FIX_CONFIRM_TEXT,
         }
 
     def configure_egress_bpf_watch(self, data: dict[str, Any]) -> dict[str, Any]:
@@ -749,9 +736,8 @@ exit 0
             raise ValueError("检测间隔必须是数字")
         interval = max(10, min(3600, interval))
         if enabled:
-            confirm = str(data.get("confirm") or "").strip()
-            if confirm != BPF_AUTO_FIX_CONFIRM_TEXT:
-                raise ValueError(f"请输入确认文本：{BPF_AUTO_FIX_CONFIRM_TEXT}")
+            if data.get("confirmed") is not True:
+                raise ValueError("请在页面完成两次确认后再开启自动修复")
             if not self._interface_exists(iface):
                 raise ValueError(f"接口不存在：{iface}")
         self._write_bpf_watch_config({
@@ -772,7 +758,7 @@ exit 0
         if status.get("suspected_igmp_block"):
             result = self.clear_egress_bpf({
                 "interface": iface,
-                "confirm": BPF_CLEAR_CONFIRM_TEXT,
+                "confirmed": True,
             })
         with self._watch_lock:
             self._watch_runtime["check_count"] += 1

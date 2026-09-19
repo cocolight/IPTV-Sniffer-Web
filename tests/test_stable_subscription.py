@@ -113,6 +113,79 @@ def test_playlist_all_is_an_explicit_compatibility_alias(tmp_path, monkeypatch):
     assert main.get_data() == alias.get_data()
 
 
+def test_rtp2httpd_subscriptions_separate_best_channels_from_all_lines(tmp_path, monkeypatch):
+    channels, operators = _install_catalog(tmp_path, monkeypatch)
+    rows = [
+        {
+            "key": "239.1.2.3:5000", "host": "239.1.2.3", "port": 5000,
+            "name": "News", "category": "其它频道", "tvg_id": "news",
+            "tvg_name": "News HD", "tvg_logo": "https://example.invalid/news.png",
+            "packets": 10, "fcc_ip": "10.0.0.1", "fcc_port": 9000, "fec_port": 9001,
+        },
+        {
+            "key": "239.1.2.4:5000", "host": "239.1.2.4", "port": 5000,
+            "name": "News", "category": "其它频道", "tvg_id": "news",
+            "tvg_name": "News HD", "packets": 1,
+        },
+        {
+            "key": "239.1.2.5:5000", "host": "239.1.2.5", "port": 5000,
+            "name": "Sports", "category": "其它频道", "tvg_id": "sports",
+            "tvg_name": "Sports", "packets": 3,
+        },
+    ]
+    channels.save_rows(rows)
+    operators.save_dict({
+        row["key"]: {
+            "key": row["key"], "host": row["host"], "port": row["port"],
+            "name": row["name"], "channel_id": row["tvg_id"],
+            "fcc_ip": row.get("fcc_ip", ""), "fcc_port": row.get("fcc_port"),
+            "fec_port": row.get("fec_port"),
+        }
+        for row in rows
+    })
+    client = app_module.app.test_client()
+
+    best = client.get("/playlist-rtp2httpd.m3u")
+    all_lines = client.get("/playlist-rtp2httpd-all.m3u")
+    best_text = best.get_data(as_text=True)
+    all_text = all_lines.get_data(as_text=True)
+
+    assert best.status_code == all_lines.status_code == 200
+    assert best.headers["Cache-Control"] == "no-store, max-age=0"
+    assert all_lines.headers["Cache-Control"] == "no-store, max-age=0"
+    assert best.headers["X-Playlist-Records"] == "2"
+    assert all_lines.headers["X-Playlist-Records"] == "3"
+    assert best_text.count("#EXTINF") == 2
+    assert all_text.count("#EXTINF") == 3
+    assert "/live/" not in best_text + all_text
+    assert "http://192.168.3.6" not in best_text + all_text
+    assert "rtp://239.1.2.3:5000?fcc=10.0.0.1:9000&fec=9001" in best_text
+    assert "rtp://239.1.2.4:5000" in all_text
+    assert 'tvg-id="news" tvg-name="News HD"' in best_text
+    assert 'group-title="其它频道"' in best_text
+    assert 'tvg-logo="https://example.invalid/news.png"' in best_text
+
+    subscription = client.get("/api/subscription").get_json()["data"]
+    assert subscription["rtp2httpd_best_count"] == 2
+    assert subscription["rtp2httpd_all_count"] == 3
+    assert subscription["urls"]["rtp2httpd"] == "/playlist-rtp2httpd.m3u"
+    assert subscription["urls"]["rtp2httpd_all"] == "/playlist-rtp2httpd-all.m3u"
+
+    news_id = next(item["stable_id"] for item in subscription["candidates"] if item["name"] == "News")
+    selected = client.post("/api/subscription/candidates", json={
+        "action": "replace",
+        "stable_ids": [news_id],
+    })
+    assert selected.status_code == 200
+
+    selected_best = client.get("/playlist-rtp2httpd.m3u")
+    selected_all = client.get("/playlist-rtp2httpd-all.m3u")
+    assert selected_best.headers["X-Playlist-Records"] == "1"
+    assert selected_all.headers["X-Playlist-Records"] == "2"
+    assert "Sports" not in selected_best.get_data(as_text=True)
+    assert "Sports" not in selected_all.get_data(as_text=True)
+
+
 def test_time_shift_minutes_is_canonical_and_old_field_remains_compatible(tmp_path, monkeypatch):
     _install_catalog(tmp_path, monkeypatch)
     client = app_module.app.test_client()

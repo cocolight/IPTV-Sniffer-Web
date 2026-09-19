@@ -435,6 +435,11 @@ td code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Conso
 }
 .backup-module-row input { margin: 0; }
 .backup-module-row small { color: var(--muted); white-space: nowrap; }
+.backup-select-all-row { margin-bottom: 10px; border-style: solid; background: #f4f8ff; }
+.backup-select-all-row small { white-space: normal; }
+.archive-panel { border: 1px solid var(--line); border-radius: 10px; padding: 12px; background: var(--surface-subtle, #fafafa); }
+.compact-title { margin-bottom: 4px; }
+.compact-title h3 { margin: 0; font-size: 0.98rem; }
 
 .badge { display: inline-flex; min-height: 24px; padding: 0 8px; border-radius: 999px; align-items: center; font-size: 12px; font-weight: 750; }
 .badge.ok { color: var(--ok); background: #e6f5ee; }

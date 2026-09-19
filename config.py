@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 
 APP_NAME = "IPTV Sniffer Web"
-APP_VERSION = "1.3.2"
+APP_VERSION = "1.3.3"
 APP_DESCRIPTION = "IPTV 频道发现、订阅管理、回看与 rtp2httpd 播放统一工作台"
 GITHUB_REPO = "roninriddle/IPTV-Sniffer-Web"
 VERSION_CHECK_INTERVAL = 6 * 3600
@@ -105,6 +105,7 @@ DEFAULT_SETTINGS = {
     "epg_des_padding": "pkcs5",
     "epg_stb_type": "",
     "epg_stb_version": "",
+    "epg_software_version": "",
     "epg_user_agent": "",
     "epg_access_user_name": "",
     # Learned from a local STB trace and used internally by the HWCU refresh

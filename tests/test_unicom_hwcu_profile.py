@@ -42,11 +42,12 @@ def test_hwcu_capture_extracts_stb_id_from_normal_form_post():
             b"POST /EPG/jsp/ValidAuthenticationHWCU.jsp HTTP/1.1\r\n"
             b"Host: 10.0.0.9:33200\r\n"
             b"Content-Type: application/x-www-form-urlencoded\r\n\r\n"
-            b"UserID=10001&STBID=STB-EXAMPLE&conntype=DHCP"
+            b"UserID=10001&STBID=STB-EXAMPLE&conntype=DHCP&SoftwareVersion=V100R001"
         )
     }
 
     credentials = _extract_epg_credentials(streams, "10.0.0.2")
 
     assert credentials["epg_stb_id"] == "STB-EXAMPLE"
+    assert credentials["epg_software_version"] == "V100R001"
     assert credentials["epg_auth_host"] == "10.0.0.9:33200"

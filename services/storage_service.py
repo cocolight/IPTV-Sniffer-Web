@@ -67,9 +67,9 @@ class LocalSecretStore:
     """Owner-only local storage for IPTV EPG recovery material.
 
     This file lives in the persistent data volume so a locally authorized key
-    survives container replacement.  It is intentionally separate from
-    settings.json: public settings responses and JSON backup exports must not
-    contain it.
+    survives container replacement.  It remains separate from settings.json;
+    the management page may show it by the owner's choice and portable backups
+    include it only through their explicit credentials module.
     """
 
     def __init__(self, path: Path) -> None:

@@ -2,6 +2,8 @@
 
 import io
 
+import pytest
+
 import app as app_module
 from services.epg_refresh_service import _update_backtv_from_channel_text
 from services.rtsp_catchup_service import RtspCatchupError
@@ -93,6 +95,32 @@ def test_iptv_auth_apply_persists_active_interface(tmp_path, monkeypatch):
         assert app_module.settings_store.load()["interface"] == "enp3s0"
     finally:
         app_module.settings_store = original_settings_store
+
+
+def test_public_settings_infers_timeshift_host_without_exposing_full_url(monkeypatch):
+    monkeypatch.setattr(
+        app_module.operator_channel_store,
+        "load",
+        lambda: {"239.1.2.3:5000": {"backtv_url": "rtsp://10.0.0.5:554/live?UserToken=secret"}},
+    )
+    monkeypatch.setattr(app_module.epg_key_store, "get_epg_key", lambda: "")
+
+    public = app_module._public_settings({"timeshift_host": ""})
+
+    assert public["timeshift_host"] == "10.0.0.5:554"
+    assert public["timeshift_host_inferred"] is True
+    assert "secret" not in public["timeshift_host"]
+
+
+def test_catchup_refresh_fails_fast_when_iptv_interface_has_no_lease(monkeypatch):
+    monkeypatch.setattr(app_module.epg_key_store, "get_epg_key", lambda: "")
+    monkeypatch.setattr(app_module.iptv_auth_service, "snapshot", lambda interface: {"ipv4": []})
+
+    with pytest.raises(ValueError, match="先在认证页执行一键认证"):
+        app_module._refresh_backtv_with_state(
+            {"interface": "enp3s0", "epg_auth_host": "10.0.0.9:8082"},
+            source="manual",
+        )
 
 
 def test_catchup_returns_gateway_timeout_and_stops_ffmpeg(tmp_path, monkeypatch):

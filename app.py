@@ -13,6 +13,7 @@ import re
 import select
 import shutil
 import subprocess
+import tempfile
 import time
 import threading
 import zipfile
@@ -99,12 +100,48 @@ def _with_local_epg_key(settings: dict[str, Any] | None = None) -> dict[str, Any
     return merged
 
 
+_CREDENTIAL_BACKUP_KEY = "credentials"
+_CREDENTIAL_SETTING_KEYS = ("iptv_password", "epg_des3_key", "epg_des3_key_configured")
+
+
 def _public_settings(settings: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Return settings without emitting local recovery material."""
+    """Return settings for the locally authorized management page.
+
+    The DES/DES3 key remains in its owner-only file at rest, but is included in
+    this response because the owner explicitly chose to view and edit it here.
+    JSON backups handle credentials through their separate opt-in module.
+    """
     public = dict(settings if settings is not None else settings_store.load())
-    public["epg_des3_key"] = ""
-    public["epg_des3_key_configured"] = epg_key_store.has_epg_key()
+    if not str(public.get("timeshift_host") or "").strip():
+        for channel in operator_channel_store.load().values():
+            backtv_url = str(channel.get("backtv_url") or "").strip()
+            if not backtv_url:
+                continue
+            host = urlsplit(backtv_url).netloc.strip()
+            if host:
+                public["timeshift_host"] = host
+                public["timeshift_host_inferred"] = True
+                break
+    public["epg_des3_key"] = epg_key_store.get_epg_key()
+    public["epg_des3_key_configured"] = bool(public["epg_des3_key"])
     return public
+
+
+def _backup_settings() -> dict[str, Any]:
+    """Export non-secret settings; credentials require explicit opt-in."""
+    settings = _public_settings()
+    for key in _CREDENTIAL_SETTING_KEYS:
+        settings.pop(key, None)
+    return settings
+
+
+def _backup_credentials() -> dict[str, str]:
+    """Build the explicit sensitive portion of a portable backup."""
+    settings = settings_store.load()
+    return {
+        "iptv_password": str(settings.get("iptv_password") or ""),
+        "epg_des3_key": epg_key_store.get_epg_key(),
+    }
 
 
 def _migrate_legacy_epg_key() -> None:
@@ -921,7 +958,9 @@ def api_interfaces():
 
 @app.get("/api/settings")
 def api_settings_get():
-    return api_success(_public_settings())
+    response = api_success(_public_settings())
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    return response
 
 
 @app.post("/api/settings")
@@ -958,7 +997,9 @@ def api_settings_save():
         ):
             epg_service.refresh_async(epg_url, logo_url if saved.get("use_logo", True) else "")
     logger.info("已保存网页默认设置")
-    return api_success(_public_settings(saved))
+    response = api_success(_public_settings(saved))
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    return response
 
 
 @app.get("/api/status")
@@ -1175,6 +1216,47 @@ def playlist_hls_subscription():
     return _subscription_response(hls_compat=True)
 
 
+def _rtp2httpd_source_rows() -> list[dict[str, Any]]:
+    catalog = _stable_channel_catalog()
+    candidate_ids = _subscription_candidate_ids(catalog)
+    selected_groups = {
+        channel_group_key(catalog[stable_id]["row"])
+        for stable_id in candidate_ids
+    }
+    if not selected_groups:
+        return []
+    operator_channels = operator_channel_store.load()
+    return [
+        _row_with_operator_stream_params(row, operator_channels)
+        for row in display_channel_rows(channel_store.list())
+        if channel_group_key(row) in selected_groups
+    ]
+
+
+def _rtp2httpd_subscription_response(*, best_only: bool) -> Response:
+    content, count = export_service.source_subscription_m3u(
+        _rtp2httpd_source_rows(),
+        settings_store.load(),
+        best_only=best_only,
+    )
+    response = Response(content, mimetype="audio/x-mpegurl")
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    response.headers["X-Playlist-Records"] = str(count)
+    return response
+
+
+@app.get("/playlist-rtp2httpd.m3u")
+def playlist_rtp2httpd_best():
+    """One best original RTP source per logical channel."""
+    return _rtp2httpd_subscription_response(best_only=True)
+
+
+@app.get("/playlist-rtp2httpd-all.m3u")
+def playlist_rtp2httpd_all():
+    """Every current original RTP source, including alternate lines."""
+    return _rtp2httpd_subscription_response(best_only=False)
+
+
 @app.get("/epg.xml")
 def epg_subscription():
     settings = settings_store.load()
@@ -1232,6 +1314,9 @@ def api_subscription():
     catalog = _stable_channel_catalog()
     candidate_ids = _subscription_candidate_ids(catalog)
     candidates = [_subscription_entry(stable_id, catalog[stable_id]) for stable_id in candidate_ids]
+    source_rows = _rtp2httpd_source_rows()
+    normalized_sources = export_service._normalize_channels(source_rows)
+    best_source_count = len(export_service._select_best_channels(normalized_sources))
     return api_success({
         "candidates": candidates,
         "candidate_ids": candidate_ids,
@@ -1239,10 +1324,14 @@ def api_subscription():
         "available_candidates": len(candidates),
         "catchup_candidates": sum(1 for item in candidates if item["has_catchup"]),
         "fcc_candidates": sum(1 for item in candidates if item["has_fcc"]),
+        "rtp2httpd_best_count": best_source_count,
+        "rtp2httpd_all_count": len(normalized_sources),
         "urls": {
             "best": "/playlist.m3u",
             "all": "/playlist-all.m3u",
             "hls": "/playlist-hls.m3u",
+            "rtp2httpd": "/playlist-rtp2httpd.m3u",
+            "rtp2httpd_all": "/playlist-rtp2httpd-all.m3u",
             "epg": "/epg.xml",
         },
     })
@@ -1480,8 +1569,12 @@ def api_operator_channels_clear():
     return api_success({"cleared": True})
 
 
-_BACKUP_VERSION = 1
-_CLEAR_ALL_CONFIRM_TEXT = "确认清除"
+_BACKUP_VERSION = 2
+_DISASTER_BACKUP_VERSION = 1
+_DISASTER_MAX_FILES = 256
+_DISASTER_MAX_UNCOMPRESSED_BYTES = 2 * 1024 * 1024 * 1024
+_DISASTER_PCAP_RE = re.compile(r"^pcaps/(stb-boot-[A-Za-z0-9._-]+\.pcap)$")
+_DISASTER_MANIFEST_RE = re.compile(r"^metadata/(stb-boot-[A-Za-z0-9._-]+)\.manifest\.json$")
 _BACKUP_FILES: list[tuple[str, Path]] = [
     ("settings", SETTINGS_FILE),
     ("channels", CHANNELS_FILE),
@@ -1495,24 +1588,39 @@ _BACKUP_FILES: list[tuple[str, Path]] = [
 ]
 
 
-def _global_backup_response(selected: list[str] | None = None) -> Response:
-    selected_keys = set(selected or [key for key, _ in _BACKUP_FILES])
-    payload: dict[str, Any] = {"_version": _BACKUP_VERSION, "_app_version": APP_VERSION, "_exported_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+def _global_backup_payload(selected: list[str] | None = None) -> dict[str, Any]:
+    selected_keys = set(selected if selected is not None else [key for key, _ in _BACKUP_FILES])
+    payload: dict[str, Any] = {
+        "schema_version": _BACKUP_VERSION,
+        "_version": _BACKUP_VERSION,
+        "_app_version": APP_VERSION,
+        "_exported_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
     for key, path in _BACKUP_FILES:
         if key not in selected_keys:
             continue
         if key == "settings":
-            payload[key] = _public_settings()
+            payload[key] = _backup_settings()
             continue
         try:
             payload[key] = json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
         except Exception:
             payload[key] = None
+    if _CREDENTIAL_BACKUP_KEY in selected_keys:
+        payload[_CREDENTIAL_BACKUP_KEY] = _backup_credentials()
+    return payload
+
+
+def _global_backup_response(selected: list[str] | None = None) -> Response:
+    payload = _global_backup_payload(selected)
     body = json.dumps(payload, ensure_ascii=False, indent=2)
     return Response(
         body,
         mimetype="application/json",
-        headers={"Content-Disposition": 'attachment; filename="iptv-sniffer-backup.json"'},
+        headers={
+            "Content-Disposition": 'attachment; filename="iptv-sniffer-backup.json"',
+            "Cache-Control": "no-store, max-age=0",
+        },
     )
 
 
@@ -1525,14 +1633,35 @@ def _normalize_global_backup_payload(data: dict[str, Any]) -> dict[str, Any]:
     legacy_initial = payload.get("initial")
     if legacy_iface and isinstance(legacy_initial, dict) and "iptv_auth_backups" not in payload:
         return {
-            "_version": _BACKUP_VERSION,
+            "schema_version": 1,
+            "_version": 1,
             "_app_version": str(payload.get("_app_version") or ""),
             "_exported_at": str(payload.get("_exported_at") or ""),
             "iptv_auth_backups": {
                 "interfaces": {legacy_iface: {"initial": legacy_initial, "history": []}},
             },
         }
-    return payload
+    normalized = dict(payload)
+    normalized["schema_version"] = normalized.get("schema_version", normalized.get("_version", 1))
+    settings = normalized.get("settings")
+    # Older backups placed the IPTV password in settings.  Split it into the
+    # new explicit module so restore still gives the owner a choice.
+    if isinstance(settings, dict):
+        settings = dict(settings)
+        existing_credentials = normalized.get(_CREDENTIAL_BACKUP_KEY)
+        credentials = dict(existing_credentials) if isinstance(existing_credentials, dict) else {}
+        legacy_credentials_migrated = False
+        for key in ("iptv_password", "epg_des3_key"):
+            if key in settings and key not in credentials:
+                credentials[key] = settings.pop(key)
+                legacy_credentials_migrated = True
+        settings.pop("epg_des3_key_configured", None)
+        normalized["settings"] = settings
+        if credentials:
+            normalized[_CREDENTIAL_BACKUP_KEY] = credentials
+        if legacy_credentials_migrated:
+            normalized["_legacy_credentials_migrated"] = True
+    return normalized
 
 
 def _auth_backup_conflicts(payload: dict[str, Any]) -> list[str]:
@@ -1549,6 +1678,272 @@ def _auth_backup_conflicts(payload: dict[str, Any]) -> list[str]:
     )
 
 
+def _restore_global_backup_payload(
+    payload: dict[str, Any],
+    selected_keys: list[str],
+    *,
+    overwrite_auth_backups: bool = False,
+) -> dict[str, Any]:
+    """Restore validated backup modules without ever echoing credential values."""
+    auth_conflicts = _auth_backup_conflicts(payload)
+    if "iptv_auth_backups" in selected_keys and auth_conflicts and not overwrite_auth_backups:
+        raise FileExistsError(
+            f"认证备份与本机接口快照冲突：{', '.join(auth_conflicts)}。请明确确认覆盖后再恢复。"
+        )
+    restored: list[str] = []
+    skipped: list[str] = []
+    if _CREDENTIAL_BACKUP_KEY in selected_keys:
+        credentials = payload.get(_CREDENTIAL_BACKUP_KEY)
+        if not isinstance(credentials, dict):
+            skipped.append(_CREDENTIAL_BACKUP_KEY)
+        else:
+            try:
+                if "iptv_password" in credentials:
+                    settings_store.save({"iptv_password": str(credentials.get("iptv_password") or "")})
+                if "epg_des3_key" in credentials:
+                    key = str(credentials.get("epg_des3_key") or "").strip()
+                    if key:
+                        epg_key_store.set_epg_key(key)
+                    else:
+                        epg_key_store.clear_epg_key()
+                restored.append(_CREDENTIAL_BACKUP_KEY)
+            except Exception as exc:
+                logger.warning(f"backup import: failed to write credentials ({type(exc).__name__})")
+                skipped.append(_CREDENTIAL_BACKUP_KEY)
+    for key, path in _BACKUP_FILES:
+        if key not in selected_keys:
+            continue
+        value = payload.get(key)
+        if value is None:
+            skipped.append(key)
+            continue
+        try:
+            if key == "settings" and isinstance(value, dict):
+                value = dict(value)
+                value.pop("epg_des3_key", None)
+                value.pop("epg_des3_key_configured", None)
+                for secret_key in _CREDENTIAL_SETTING_KEYS:
+                    value.pop(secret_key, None)
+                settings_store.save(value)
+            else:
+                path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                temp_path = path.with_name(f".{path.name}.{time.time_ns()}.tmp")
+                try:
+                    temp_path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+                    os.chmod(temp_path, 0o600)
+                    os.replace(temp_path, path)
+                finally:
+                    if temp_path.exists():
+                        temp_path.unlink()
+            restored.append(key)
+        except Exception as exc:
+            logger.warning(f"backup import: failed to write {key}: {type(exc).__name__}")
+            skipped.append(key)
+    if "operator_channels" in restored:
+        operator_channel_store.invalidate()
+    restore_warnings: list[str] = []
+    restored_set = set(restored)
+    if ("settings" in restored_set) != ("operator_channels" in restored_set):
+        restore_warnings.append("仅恢复了部分回看数据；完整恢复需要同时选择“应用与导出设置”和“运营商频道表”。")
+    catchup_refresh_required = "operator_channels" in restored_set
+    if catchup_refresh_required:
+        restore_warnings.append("运营商频道表中的回看 Token 可能已过期，请在恢复后执行一次回看刷新。")
+    return {
+        "restored": restored,
+        "skipped": skipped,
+        "selected": selected_keys,
+        "warnings": restore_warnings,
+        "catchup_refresh_required": catchup_refresh_required,
+    }
+
+
+def _sha256_stream(stream: Any) -> str:
+    digest = hashlib.sha256()
+    while True:
+        chunk = stream.read(1024 * 1024)
+        if not chunk:
+            break
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _zip_write_bytes(zf: zipfile.ZipFile, name: str, content: bytes, checksums: dict[str, str]) -> None:
+    zf.writestr(name, content)
+    checksums[name] = hashlib.sha256(content).hexdigest()
+
+
+def _zip_write_file(zf: zipfile.ZipFile, name: str, path: Path, checksums: dict[str, str]) -> None:
+    digest = hashlib.sha256()
+    with path.open("rb") as source, zf.open(name, "w", force_zip64=True) as target:
+        while True:
+            chunk = source.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            target.write(chunk)
+    checksums[name] = digest.hexdigest()
+
+
+def _deployment_recovery_manifest() -> dict[str, Any]:
+    settings = settings_store.load()
+    interface = str(settings.get("interface") or "").strip()
+    snapshot: dict[str, Any] | None = None
+    if interface:
+        try:
+            snapshot = iptv_auth_service.snapshot(interface)
+        except Exception:
+            snapshot = None
+    return {
+        "schema_version": 1,
+        "app_version": APP_VERSION,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "container": {
+            "network_mode": "host",
+            "required_capabilities": ["NET_ADMIN", "NET_RAW"],
+            "web_port_at_export": WEB_PORT,
+            "data_dir": "/app/data",
+            "output_dir": "/app/output",
+        },
+        "iptv_network": {
+            "interface": interface,
+            "network_manager_unmanaged_required": bool(interface),
+            "route_requirements": ["10.0.0.0/8", "224.0.0.0/4"],
+            "snapshot": snapshot,
+        },
+        "restore_notes": [
+            "Install the same or a compatible IPTV Sniffer Web image before import.",
+            "Import restores application state, plaintext credentials, raw PCAPs and protocol manifests.",
+            "Host network mode, capabilities, interface management and routes remain host-level responsibilities.",
+            "Refresh catchup once after restore because server-side sessions and tokens may expire.",
+        ],
+    }
+
+
+def _disaster_readme() -> bytes:
+    return (
+        "IPTV Sniffer Web complete disaster-recovery package\n\n"
+        "HIGHLY SENSITIVE: backup.json contains plaintext IPTV password/key material, and raw PCAPs may "
+        "contain authentication traffic. Store this ZIP only in a trusted private location.\n\n"
+        "Restore order:\n"
+        "1. Install the same or a compatible application image.\n"
+        "2. Use host networking and grant NET_ADMIN + NET_RAW.\n"
+        "3. Keep the dedicated IPTV interface unmanaged by NetworkManager and restore required routes.\n"
+        "4. Import this ZIP from the management page.\n"
+        "5. Apply normal IPTV authentication and refresh catchup once.\n\n"
+        "The ZIP intentionally excludes application logs, HLS temporary files, EPG cache, generated output, "
+        "runtime DHCP processes, Cookie/JSESSIONID state and the Docker image itself.\n"
+    ).encode("utf-8")
+
+
+def _disaster_archive_targets(zf: zipfile.ZipFile) -> dict[str, Path]:
+    targets: dict[str, Path] = {}
+    pcap_bases: set[str] = set()
+    for info in zf.infolist():
+        pcap_match = _DISASTER_PCAP_RE.fullmatch(info.filename)
+        if pcap_match:
+            if not stb_discovery_service.archive_dir:
+                raise ValueError("未配置 STB 抓包归档目录")
+            filename = pcap_match.group(1)
+            pcap_bases.add(Path(filename).stem)
+            targets[info.filename] = Path(stb_discovery_service.archive_dir) / filename
+            continue
+        manifest_match = _DISASTER_MANIFEST_RE.fullmatch(info.filename)
+        if manifest_match:
+            if not stb_discovery_service.archive_dir:
+                raise ValueError("未配置 STB 抓包归档目录")
+            stem = manifest_match.group(1)
+            targets[info.filename] = Path(stb_discovery_service.archive_dir) / f"{stem}.artifacts" / "manifest.json"
+    manifest_bases = {
+        match.group(1)
+        for info in zf.infolist()
+        if (match := _DISASTER_MANIFEST_RE.fullmatch(info.filename))
+    }
+    if not manifest_bases.issubset(pcap_bases):
+        raise ValueError("灾备包中存在没有对应 PCAP 的协议清单")
+    return targets
+
+
+def _validate_disaster_zip(zf: zipfile.ZipFile) -> tuple[dict[str, Any], dict[str, Path], dict[str, str]]:
+    infos = zf.infolist()
+    if not infos or len(infos) > _DISASTER_MAX_FILES:
+        raise ValueError("灾备包文件数量不合法")
+    if len({info.filename for info in infos}) != len(infos):
+        raise ValueError("灾备包中存在重名文件")
+    if any(info.is_dir() for info in infos):
+        raise ValueError("灾备包不应包含独立目录项")
+    total_size = sum(info.file_size for info in infos)
+    if total_size > _DISASTER_MAX_UNCOMPRESSED_BYTES:
+        raise ValueError("灾备包解压后超过 2 GiB 安全限制")
+    required = {"backup.json", "deployment.json", "README.txt", "CHECKSUMS.sha256"}
+    names = {info.filename for info in infos}
+    if not required.issubset(names):
+        raise ValueError("不是完整的 IPTV Sniffer Web 灾备包")
+    allowed = required | {
+        name for name in names
+        if _DISASTER_PCAP_RE.fullmatch(name) or _DISASTER_MANIFEST_RE.fullmatch(name)
+    }
+    unsupported = sorted(names - allowed)
+    if unsupported:
+        raise ValueError(f"灾备包包含不支持的路径：{unsupported[0]}")
+    checksum_text = zf.read("CHECKSUMS.sha256").decode("utf-8")
+    checksums: dict[str, str] = {}
+    for line in checksum_text.splitlines():
+        if not line.strip():
+            continue
+        match = re.fullmatch(r"([0-9a-f]{64})  (.+)", line)
+        if not match or match.group(2) in checksums:
+            raise ValueError("灾备包校验清单格式错误")
+        checksums[match.group(2)] = match.group(1)
+    expected_names = names - {"CHECKSUMS.sha256"}
+    if set(checksums) != expected_names:
+        raise ValueError("灾备包校验清单与文件内容不匹配")
+    for name, expected in checksums.items():
+        with zf.open(name) as stream:
+            actual = _sha256_stream(stream)
+        if actual != expected:
+            raise ValueError(f"灾备包校验失败：{name}")
+    try:
+        package_backup = json.loads(zf.read("backup.json"))
+    except Exception as exc:
+        raise ValueError("灾备包中的 backup.json 无法读取") from exc
+    payload = _normalize_global_backup_payload(package_backup)
+    targets = _disaster_archive_targets(zf)
+    available_modules = [key for key, _ in _BACKUP_FILES if payload.get(key) is not None]
+    if payload.get(_CREDENTIAL_BACKUP_KEY) is not None:
+        available_modules.append(_CREDENTIAL_BACKUP_KEY)
+    if not available_modules and not targets:
+        raise ValueError("备份 ZIP 中没有可恢复的模块或 PCAP")
+    return payload, targets, checksums
+
+
+def _write_zip_member_private(zf: zipfile.ZipFile, member: str, target: Path) -> None:
+    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(target.parent, 0o700)
+    temp_path = target.with_name(f".{target.name}.{time.time_ns()}.tmp")
+    try:
+        with zf.open(member) as source, temp_path.open("wb") as output:
+            shutil.copyfileobj(source, output, length=1024 * 1024)
+        os.chmod(temp_path, 0o600)
+        os.replace(temp_path, target)
+        os.chmod(target, 0o600)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+
+def _stream_private_temp_file(path: Path):
+    """Stream a sensitive temporary export and remove it even under Waitress."""
+    try:
+        with path.open("rb") as stream:
+            while True:
+                chunk = stream.read(1024 * 1024)
+                if not chunk:
+                    break
+                yield chunk
+    finally:
+        path.unlink(missing_ok=True)
+
+
 @app.get("/api/backup/export")
 def api_backup_export():
     return _global_backup_response()
@@ -1558,7 +1953,7 @@ def api_backup_export():
 def api_backup_export_selected():
     data = request.get_json(silent=True) or {}
     modules = data.get("modules") if isinstance(data, dict) else None
-    known = {key for key, _ in _BACKUP_FILES}
+    known = {key for key, _ in _BACKUP_FILES} | {_CREDENTIAL_BACKUP_KEY}
     if not isinstance(modules, list):
         return api_error("modules 必须是数组", 400)
     selected = [str(key) for key in modules if str(key) in known]
@@ -1577,9 +1972,17 @@ def api_backup_inspect():
     except ValueError as exc:
         return api_error(str(exc))
     available = [key for key, _ in _BACKUP_FILES if payload.get(key) is not None]
+    if payload.get(_CREDENTIAL_BACKUP_KEY) is not None:
+        available.append(_CREDENTIAL_BACKUP_KEY)
     if not available:
         return api_error("不是可恢复的全局备份文件")
-    return api_success({"backup": payload, "available": available, "auth_conflicts": _auth_backup_conflicts(payload)})
+    response = api_success({
+        "backup": payload,
+        "available": available,
+        "auth_conflicts": _auth_backup_conflicts(payload),
+    })
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    return response
 
 
 @app.post("/api/backup/import")
@@ -1592,7 +1995,7 @@ def api_backup_import():
     except ValueError as exc:
         return api_error(str(exc))
     selected = data.get("modules") if isinstance(data.get("modules"), list) else None
-    known = {key for key, _ in _BACKUP_FILES}
+    known = {key for key, _ in _BACKUP_FILES} | {_CREDENTIAL_BACKUP_KEY}
     if selected is None:
         selected_keys = [key for key, _ in _BACKUP_FILES]
     else:
@@ -1602,40 +2005,171 @@ def api_backup_import():
     auth_conflicts = _auth_backup_conflicts(payload)
     if "iptv_auth_backups" in selected_keys and auth_conflicts and not bool(data.get("overwrite_auth_backups", False)):
         return api_error(f"认证备份与本机接口快照冲突：{', '.join(auth_conflicts)}。请明确确认覆盖后再恢复。", 409)
-    restored: list[str] = []
-    skipped: list[str] = []
-    for key, path in _BACKUP_FILES:
-        if key not in selected_keys:
-            continue
-        value = payload.get(key)
-        if value is None:
-            skipped.append(key)
-            continue
-        try:
-            if key == "settings" and isinstance(value, dict):
-                value = dict(value)
-                legacy_key = str(value.pop("epg_des3_key", "") or "").strip()
-                value.pop("epg_des3_key_configured", None)
-                if legacy_key:
-                    epg_key_store.set_epg_key(legacy_key)
-            path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
-            restored.append(key)
-        except Exception as exc:
-            logger.warning(f"backup import: failed to write {key}: {exc}")
-            skipped.append(key)
-    if "operator_channels" in restored:
-        operator_channel_store.invalidate()
-    logger.info(f"全局备份导入完成：已恢复 {len(restored)} 项，跳过 {len(skipped)} 项")
-    return api_success({"restored": restored, "skipped": skipped, "selected": selected_keys})
+    result = _restore_global_backup_payload(
+        payload,
+        selected_keys,
+        overwrite_auth_backups=bool(data.get("overwrite_auth_backups", False)),
+    )
+    logger.info(f"全局备份导入完成：已恢复 {len(result['restored'])} 项，跳过 {len(result['skipped'])} 项")
+    return api_success(result)
+
+
+@app.post("/api/backup/disaster-export")
+def api_disaster_backup_export():
+    json_data = request.get_json(silent=True)
+    data = json_data if isinstance(json_data, dict) else request.form.to_dict()
+    confirmed = data.get("confirmed") is True if isinstance(json_data, dict) else str(data.get("confirmed") or "").strip().lower() in {"1", "true", "yes"}
+    if not confirmed:
+        return api_error("请在页面完成两次确认后再导出", 400)
+    raw_modules = data.get("modules") if isinstance(json_data, dict) else request.form.getlist("modules")
+    known_modules = {key for key, _ in _BACKUP_FILES} | {_CREDENTIAL_BACKUP_KEY, "pcap_archives"}
+    if not isinstance(raw_modules, list):
+        return api_error("modules 必须是数组", 400)
+    selected_modules = [str(key) for key in raw_modules if str(key) in known_modules]
+    if not selected_modules:
+        return api_error("请至少选择一个要备份的模块", 400)
+    include_pcaps = "pcap_archives" in selected_modules
+    backup_modules = [key for key in selected_modules if key != "pcap_archives"]
+    DATA_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=".iptv-disaster-", suffix=".zip", dir=str(DATA_DIR))
+    os.close(fd)
+    temp_path = Path(temp_name)
+    try:
+        backup = _global_backup_payload(backup_modules)
+        backup["_disaster_package_version"] = _DISASTER_BACKUP_VERSION
+        backup["_selected_modules"] = selected_modules
+        backup_bytes = json.dumps(backup, ensure_ascii=False, indent=2).encode("utf-8")
+        deployment_bytes = json.dumps(
+            _deployment_recovery_manifest(), ensure_ascii=False, indent=2,
+        ).encode("utf-8")
+        checksums: dict[str, str] = {}
+        with zipfile.ZipFile(temp_path, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
+            _zip_write_bytes(zf, "backup.json", backup_bytes, checksums)
+            _zip_write_bytes(zf, "deployment.json", deployment_bytes, checksums)
+            _zip_write_bytes(zf, "README.txt", _disaster_readme(), checksums)
+            archive_dir = stb_discovery_service.archive_dir
+            if include_pcaps and archive_dir:
+                for pcap_path in sorted(Path(archive_dir).glob("stb-boot-*.pcap")):
+                    if not pcap_path.is_file():
+                        continue
+                    _zip_write_file(zf, f"pcaps/{pcap_path.name}", pcap_path, checksums)
+                    manifest_path = Path(archive_dir) / f"{pcap_path.stem}.artifacts" / "manifest.json"
+                    if manifest_path.is_file():
+                        _zip_write_file(
+                            zf,
+                            f"metadata/{pcap_path.stem}.manifest.json",
+                            manifest_path,
+                            checksums,
+                        )
+            checksum_body = "".join(
+                f"{digest}  {name}\n" for name, digest in sorted(checksums.items())
+            ).encode("utf-8")
+            zf.writestr("CHECKSUMS.sha256", checksum_body)
+        os.chmod(temp_path, 0o600)
+        timestamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+        size = temp_path.stat().st_size
+        response = Response(
+            _stream_private_temp_file(temp_path),
+            mimetype="application/zip",
+            direct_passthrough=True,
+        )
+        response.headers["Content-Disposition"] = (
+            f'attachment; filename="iptv-sniffer-disaster-{timestamp}.zip"'
+        )
+        response.headers["Content-Length"] = str(size)
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        logger.warning(
+            f"已导出迁移备份 ZIP：模块 {len(selected_modules)} 项，"
+            f"明文凭据={'是' if _CREDENTIAL_BACKUP_KEY in selected_modules else '否'}，"
+            f"原始 PCAP={'是' if include_pcaps else '否'}"
+        )
+        return response
+    except Exception as exc:
+        temp_path.unlink(missing_ok=True)
+        logger.warning(f"完整灾备包导出失败：{type(exc).__name__}")
+        return api_error("完整灾备包导出失败，请检查数据目录空间与抓包文件权限", 500)
+
+
+@app.post("/api/backup/disaster-import")
+def api_disaster_backup_import():
+    if str(request.form.get("confirmed") or "").strip().lower() not in {"1", "true", "yes"}:
+        return api_error("请在页面完成两次确认后再恢复", 400)
+    upload = request.files.get("file")
+    if upload is None or not upload.filename:
+        return api_error("请选择完整灾备 ZIP 文件", 400)
+    if not str(upload.filename).lower().endswith(".zip"):
+        return api_error("完整灾备文件必须是 ZIP 格式", 400)
+    try:
+        upload.stream.seek(0)
+        with zipfile.ZipFile(upload.stream, "r") as zf:
+            payload, targets, checksums = _validate_disaster_zip(zf)
+            archive_conflicts: list[str] = []
+            archive_skipped: list[str] = []
+            for member, target in targets.items():
+                if not target.exists():
+                    continue
+                with target.open("rb") as existing:
+                    existing_digest = _sha256_stream(existing)
+                if existing_digest == checksums[member]:
+                    archive_skipped.append(member)
+                else:
+                    archive_conflicts.append(member)
+            if archive_conflicts:
+                return api_error(
+                    f"归档中已存在同名但内容不同的文件：{archive_conflicts[0]}。为避免覆盖原始抓包，已取消恢复。",
+                    409,
+                )
+            auth_conflicts = _auth_backup_conflicts(payload)
+            selected = [key for key, _ in _BACKUP_FILES if payload.get(key) is not None]
+            if payload.get(_CREDENTIAL_BACKUP_KEY) is not None:
+                selected.append(_CREDENTIAL_BACKUP_KEY)
+            imported_archives: list[str] = []
+            for member, target in targets.items():
+                if member in archive_skipped:
+                    continue
+                _write_zip_member_private(zf, member, target)
+                imported_archives.append(member)
+            result = _restore_global_backup_payload(
+                payload, selected, overwrite_auth_backups=True,
+            ) if selected else {
+                "restored": [],
+                "skipped": [],
+                "selected": [],
+                "warnings": [],
+                "catchup_refresh_required": False,
+            }
+        result.update({
+            "pcap_archives_restored": sum(name.startswith("pcaps/") for name in imported_archives),
+            "protocol_manifests_restored": sum(name.startswith("metadata/") for name in imported_archives),
+            "archive_files_skipped": len(archive_skipped),
+            "auth_conflicts_overwritten": auth_conflicts,
+            "network_restore_required": True,
+        })
+        result["warnings"].append(
+            "完整灾备已恢复；宿主机网卡托管、IPTV DHCP 认证和路由仍需在新机器上按部署说明完成。"
+        )
+        logger.warning(
+            f"完整灾备包恢复完成：模块 {len(result['restored'])} 项，"
+            f"新归档 {len(imported_archives)} 个，已存在 {len(archive_skipped)} 个"
+        )
+        response = api_success(result)
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        return response
+    except zipfile.BadZipFile:
+        return api_error("无法读取 ZIP 文件，文件可能已损坏", 400)
+    except ValueError as exc:
+        return api_error(str(exc), 400)
+    except Exception as exc:
+        logger.warning(f"完整灾备包恢复失败：{type(exc).__name__}")
+        return api_error("完整灾备包恢复失败，请检查数据目录空间与文件权限", 500)
 
 
 @app.post("/api/backup/clear-all")
 def api_backup_clear_all():
     """Delete all locally persisted config/data files, resetting the app to a fresh state."""
     data = request.get_json(silent=True) or {}
-    confirm = str(data.get("confirm", "")).strip()
-    if confirm != _CLEAR_ALL_CONFIRM_TEXT:
-        return api_error(f"请输入确认文本：{_CLEAR_ALL_CONFIRM_TEXT}", 400)
+    if data.get("confirmed") is not True:
+        return api_error("请在页面完成两次确认后再清除", 400)
     cleared: list[str] = []
     for key, path in _BACKUP_FILES:
         try:
@@ -1648,7 +2182,7 @@ def api_backup_clear_all():
     cleared.append("epg_local_key")
     operator_channel_store.invalidate()
     logger.info(f"本地配置已清除：{', '.join(cleared) or '无'}")
-    return api_success({"cleared": cleared, "confirm_text": _CLEAR_ALL_CONFIRM_TEXT})
+    return api_success({"cleared": cleared})
 
 
 @app.get("/api/channels/snapshots")
@@ -1796,6 +2330,22 @@ def api_stb_discovery_archives():
     return api_success({"archives": stb_discovery_service.list_archives()})
 
 
+@app.delete("/api/stb_discovery/archives/<path:archive_name>")
+def api_stb_discovery_archive_delete(archive_name: str):
+    data = request.get_json(silent=True) or {}
+    if data.get("confirmed") is not True:
+        return api_error("请在页面完成两次确认后再删除", 400)
+    try:
+        result = stb_discovery_service.delete_archive(archive_name)
+    except FileNotFoundError as exc:
+        return api_error(str(exc), 404)
+    logger.warning(
+        f"已删除历史抓包 {result['name']}（{result['size']} 字节），"
+        f"协议清单={'已删除' if result['artifacts_deleted'] else '无'}"
+    )
+    return api_success(result)
+
+
 @app.get("/api/stb_discovery/archive-backup")
 def api_stb_discovery_archive_backup():
     """Export a persisted raw PCAP as a portable local backup ZIP."""
@@ -1858,6 +2408,7 @@ def api_stb_discovery_import():
             "epg_user_agent": "epg_user_agent",
             "epg_stb_type": "epg_stb_type",
             "epg_stb_version": "epg_stb_version",
+            "epg_software_version": "epg_software_version",
             "access_user_name": "epg_access_user_name",
             "epg_net_user_id": "epg_net_user_id",
             "epg_conn_type": "epg_conn_type",
@@ -2189,7 +2740,7 @@ def _effective_stb_auth_info() -> dict[str, Any]:
     auth_info = _merged_stb_auth_info()
     # HWCU includes an IPTV-side address in its Authenticator.  A persisted
     # STB boot capture is valuable for the terminal identity, but its old
-    # lease can no longer represent the current 8788 test client.  Prefer the
+    # lease can no longer represent the current client.  Prefer the
     # active authenticated interface address whenever it is available.
     interface = str(settings_store.load().get("interface") or "").strip()
     if interface:
@@ -2246,6 +2797,18 @@ def _catchup_refresh_status(settings: dict[str, Any] | None = None) -> dict[str,
 
 def _refresh_backtv_with_state(settings: dict[str, Any], source: str) -> dict[str, Any]:
     settings = _with_local_epg_key(settings)
+    interface = str(settings.get("interface") or "").strip()
+    epg_host = str(settings.get("epg_auth_host") or "").strip()
+    if interface and epg_host.startswith("10."):
+        snapshot = iptv_auth_service.snapshot(interface)
+        has_iptv_ip = any(
+            str(item.get("local") or "").startswith("10.")
+            for item in (snapshot.get("ipv4") or [])
+        )
+        if not has_iptv_ip:
+            raise ValueError(
+                f"IPTV 接口 {interface} 尚未取得 IPTV 地址，请先在认证页执行一键认证"
+            )
     now = int(time.time())
     with _catchup_refresh_lock:
         if _catchup_auto_state.get("running"):
@@ -2277,10 +2840,11 @@ def _refresh_backtv_with_state(settings: dict[str, Any], source: str) -> dict[st
             })
         return result
     except Exception as exc:
+        safe_error = redact_sensitive_text(str(exc))
         with _catchup_refresh_lock:
             _catchup_auto_state.update({
                 "running": False,
-                "last_error": str(exc),
+                "last_error": safe_error,
                 "next_run_at": int(time.time()) + _catchup_refresh_interval_hours(settings) * 3600
                 if _catchup_auto_enabled(settings) else None,
             })
@@ -2343,6 +2907,7 @@ def api_catchup_refresh():
         "epg_des_padding",
         "epg_stb_type",
         "epg_stb_version",
+        "epg_software_version",
         "epg_user_agent",
         "epg_access_user_name",
         "epg_net_user_id",
@@ -2354,10 +2919,10 @@ def api_catchup_refresh():
     try:
         result = _refresh_backtv_with_state(settings, source="manual")
     except (ValueError, RuntimeError) as exc:
-        return api_error(str(exc), 400)
+        return api_error(redact_sensitive_text(str(exc)), 400)
     except Exception as exc:
-        logger.error(f"EPG 回看地址刷新异常：{exc}")
-        return api_error(f"刷新失败：{exc}", 500)
+        logger.error(f"EPG 回看地址刷新异常：{redact_sensitive_text(str(exc))}")
+        return api_error("回看刷新发生内部错误，请查看服务日志", 500)
     logger.info(
         f"EPG 回看地址刷新：更新 {result['updated']} / {result['total']} 个频道，"
         f"EPG={result['epg_host']}，Profile={result.get('profile', 'auto')}"
