@@ -1447,6 +1447,72 @@ function renderStbDiscoveryStatus(state) {
     box.textContent = "等待开始…";
     box.className = "result-box muted";
   }
+  renderStbDiscoveryDiagnostics(state);
+}
+
+function formatBytes(size) {
+  const bytes = Math.max(0, Number(size || 0));
+  if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  if (bytes >= 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${bytes} B`;
+}
+
+// 诊断结论按「数据在哪一环断掉」排序，从采集到解析逐级收窄，
+// 这样用户看到的是可执行的下一步，而不是一堆计数。
+function stbDiagnosticsConclusions(diag) {
+  const notes = [];
+  const pcapSize = Number(diag.pcap_size || 0);
+  const streams = Number(diag.stream_count || 0);
+  const matched = Number(diag.matched_response_streams || 0);
+  const channels = Number(diag.channels || 0);
+  if (pcapSize <= 0) {
+    notes.push("tcpdump 没有写出任何数据：确认抓包网卡是真实物理口（不要用 any），"
+      + "容器需要 network_mode: host 与 cap_add NET_ADMIN, NET_RAW。");
+  } else if (diag.mac_not_seen) {
+    notes.push(`抓包中完全没有出现 MAC ${diag.mac_requested || ""}：确认填的是机顶盒的 MAC 而不是光猫的，`
+      + "且抓包点能看到机顶盒与 IPTV 网关之间的流量。");
+  } else if (streams <= 0) {
+    notes.push("抓到了数据但没有重组出任何 TCP 流：过滤条件可能过窄，"
+      + "或该网口上看不到机顶盒与 IPTV 网关之间的单播流量。");
+  } else if (matched <= 0) {
+    notes.push(`重组出 ${streams} 条 TCP 流，但没有一条响应流指向机顶盒 IP：`
+      + "确认机顶盒 IP 填写正确（DHCP 可能分配了别的地址），并在捕获期间重启机顶盒。");
+  } else if (channels <= 0) {
+    notes.push(`匹配到 ${matched} 条响应流，但没有解析出频道表：`
+      + "抓包很可能没有覆盖机顶盒开机全过程（频道表通常在开机后 30–60 秒下发），请延长捕获时间后重试。");
+  } else {
+    notes.push(`链路正常：抓到 ${formatBytes(pcapSize)} 数据、${streams} 条 TCP 流、`
+      + `${matched} 条响应流，解析出 ${channels} 个频道。`);
+  }
+  return notes;
+}
+
+function renderStbDiscoveryDiagnostics(state) {
+  const details = $("stbDiscoveryDiagnostics");
+  const tbody = $("stbDiscoveryDiagBody");
+  const conclusion = $("stbDiscoveryDiagConclusion");
+  if (!details || !tbody || !conclusion) return;
+  const diag = state.diagnostics || {};
+  const rows = [];
+  const addRow = (label, value, mono) => rows.push(
+    `<tr><td class="diag-item">${escapeHtml(label)}</td>`
+    + `<td class="${mono ? "stb-diag-value" : ""}">${escapeHtml(String(value))}</td></tr>`
+  );
+  if (diag.pcap_size !== undefined) addRow("抓包大小", formatBytes(diag.pcap_size));
+  if (diag.mac_requested) addRow("过滤 MAC", diag.mac_requested, true);
+  if (diag.mac_seen_count !== undefined) addRow("该 MAC 出现次数", Number(diag.mac_seen_count).toLocaleString("zh-CN"), true);
+  if (diag.stream_count !== undefined) addRow("TCP 流", Number(diag.stream_count).toLocaleString("zh-CN"), true);
+  if (diag.matched_response_streams !== undefined) addRow("匹配响应流", Number(diag.matched_response_streams).toLocaleString("zh-CN"), true);
+  if (diag.channels !== undefined) addRow("解析出频道", Number(diag.channels).toLocaleString("zh-CN"), true);
+  if (!rows.length) {
+    details.hidden = true;
+    return;
+  }
+  details.hidden = false;
+  tbody.innerHTML = rows.join("");
+  conclusion.innerHTML = "<ul>"
+    + stbDiagnosticsConclusions(diag).map((note) => `<li>${escapeHtml(note)}</li>`).join("")
+    + "</ul>";
 }
 
 function renderStbDiscoveryArchives(archives) {

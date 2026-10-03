@@ -1288,6 +1288,7 @@ class StbDiscoveryService:
             "auth_info": {},
             "archived_pcap": "",
             "protocol_artifacts": {"saved": False},
+            "diagnostics": {},
         }
         self._proc: subprocess.Popen | None = None
         self._pcap_path: str | None = None
@@ -1609,6 +1610,7 @@ class StbDiscoveryService:
                 "pcap_available": False,
                 "pcap_size": 0,
                 "protocol_artifacts": {"saved": False},
+                "diagnostics": {},
             }
         cmd = [
             "tcpdump",
@@ -1772,6 +1774,7 @@ class StbDiscoveryService:
                 "auth_info": {},
                 "archived_pcap": "",
                 "protocol_artifacts": {"saved": False},
+                "diagnostics": {},
                 "pcap_available": False,
                 "pcap_size": 0,
             }
