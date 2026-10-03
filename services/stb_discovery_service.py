@@ -20,6 +20,25 @@ from typing import Any
 from services.log_service import AppLogger
 
 
+def _probe_tcpdump_interfaces() -> str:
+    """确认 tcpdump 真的能列出抓包接口，否则权限/容器配置问题无法提前暴露。
+
+    独立成函数而不是内联在 runtime_check 里，是为了给测试一个明确的替身点：
+    测试会 mock Popen，若自检也直接调 subprocess.run 就会与替身冲突。
+    """
+    proc = subprocess.run(
+        ["tcpdump", "-D"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or f"tcpdump -D 退出码 {proc.returncode}")
+    return proc.stdout or ""
+
+
 def _parse_ip(data: bytes, off: int) -> str:
     return ".".join(str(b) for b in data[off : off + 4])
 
@@ -1288,6 +1307,9 @@ class StbDiscoveryService:
             "auth_info": {},
             "archived_pcap": "",
             "protocol_artifacts": {"saved": False},
+            "live_watcher_errors": 0,
+            "live_last_error": None,
+            "diagnostics": {},
         }
         self._proc: subprocess.Popen | None = None
         self._pcap_path: str | None = None
@@ -1564,12 +1586,54 @@ class StbDiscoveryService:
                     if self._state["status"] == self.STATUS_CAPTURING:
                         self._state["live_channel_count"] = len(channels)
                         self._state["live_has_auth"] = has_auth
-            except Exception:
-                pass
+                        self._state["live_watcher_errors"] = 0
+                        self._state["live_last_error"] = None
+            except Exception as exc:
+                # 预览解析失败不影响捕获本身，但必须留痕，否则界面上的
+                # live_channel_count=0 无法区分「还没抓到」与「解析器坏了」。
+                with self._lock:
+                    self._state["live_watcher_errors"] = (
+                        int(self._state.get("live_watcher_errors", 0)) + 1
+                    )
+                    self._state["live_last_error"] = f"{type(exc).__name__}: {exc}"
+                self.logger.warning(f"STB 捕获预览解析失败：{type(exc).__name__}: {exc}")
 
     def runtime_check(self) -> dict[str, Any]:
-        ok = shutil.which("tcpdump") is not None
-        return {"ok": ok, "errors": [] if ok else ["缺少依赖命令：tcpdump"]}
+        """验证抓包运行时依赖，而不只是确认二进制在 PATH 里。
+
+        `shutil.which` 成功不代表 tcpdump 真的能用：缺 NET_RAW/cap_net_raw 时
+        它会立即退出，缺 CAP_NET_ADMIN 或跑在容器 bridge 网络下时列不出接口。
+        这两种情况都必须在这里报出来，而不是等到捕获阶段静默失败。
+        """
+        errors: list[str] = []
+        for binary in ("tcpdump", "ip"):
+            if shutil.which(binary) is None:
+                errors.append(f"缺少依赖命令：{binary}")
+        if not errors:
+            try:
+                _probe_tcpdump_interfaces()
+            except FileNotFoundError as exc:
+                errors.append(f"tcpdump 无法执行：{exc}")
+            except RuntimeError as exc:
+                errors.append(
+                    f"tcpdump 无法列出抓包接口：{exc}。"
+                    "容器通常需要 network_mode: host 与 cap_add NET_ADMIN, NET_RAW；"
+                    "podman rootless 需额外授予 NET_RAW"
+                )
+            except subprocess.TimeoutExpired:
+                errors.append("tcpdump -D 超时，tcpdump 可能处于异常状态")
+            except Exception as exc:
+                errors.append(
+                    f"tcpdump 无法列出抓包接口：{exc}。"
+                    "容器通常需要 network_mode: host 与 cap_add NET_ADMIN, NET_RAW"
+                )
+        result = {"ok": not errors, "errors": errors}
+        if errors:
+            for error in errors:
+                self.logger.error(error)
+        else:
+            self.logger.info("运行环境检查通过：tcpdump、ip 与抓包权限可用")
+        return result
 
     def status(self) -> dict[str, Any]:
         with self._lock:
@@ -1609,6 +1673,8 @@ class StbDiscoveryService:
                 "pcap_available": False,
                 "pcap_size": 0,
                 "protocol_artifacts": {"saved": False},
+                "live_watcher_errors": 0,
+                "live_last_error": None,
             }
         cmd = [
             "tcpdump",
@@ -1627,18 +1693,71 @@ class StbDiscoveryService:
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                env={**os.environ, "LC_ALL": "C"},
             )
         except Exception as exc:
             with self._lock:
                 self._state["status"] = self.STATUS_ERROR
                 self._state["error"] = str(exc)
             raise
+        # tcpdump 可能在启动后立刻退出（接口不存在、不支持混杂模式、权限不足）。
+        # 不检查的话状态会永远停在 capturing，用户只能干等。
+        time.sleep(0.25)
+        if self._proc.poll() is not None:
+            detail = self._drain_stderr()
+            message = detail or f"tcpdump 启动后立即退出（退出码 {self._proc.returncode}）"
+            with self._lock:
+                self._state["status"] = self.STATUS_ERROR
+                self._state["error"] = message
+                self._state["stopped_at"] = time.time()
+            self.logger.error(f"tcpdump 启动失败：{message}")
+            self._proc = None
+            raise RuntimeError(message)
+        threading.Thread(
+            target=self._stderr_reader,
+            args=(self._proc,),
+            daemon=True,
+            name="stb-stderr-reader",
+        ).start()
         threading.Thread(
             target=self._live_watcher,
             args=(self._pcap_path, stb_ip),
             daemon=True,
             name="stb-live-watcher",
         ).start()
+
+    def _drain_stderr(self) -> str:
+        """读取并记录 tcpdump 的 stderr，返回最后若干行用于错误提示。"""
+        proc = self._proc
+        if proc is None or proc.stderr is None:
+            return ""
+        try:
+            text = proc.stderr.read()
+        except Exception:
+            return ""
+        if not text:
+            return ""
+        for line in text.strip().splitlines():
+            self.logger.info(f"tcpdump: {line.strip()}")
+        return text.strip()
+
+    def _stderr_reader(self, proc: subprocess.Popen[str]) -> None:
+        """持续消费 tcpdump 的 stderr。
+
+        这个管道必须有人读：既是为了拿到 tcpdump 的告警/错误，也是为了避免
+        长时间抓包时管道缓冲区写满、把 tcpdump 阻塞在写 stderr 上而停止抓包。
+        """
+        if proc.stderr is None:
+            return
+        try:
+            for line in proc.stderr:
+                clean = line.strip()
+                if clean:
+                    self.logger.info(f"tcpdump: {clean}")
+        except Exception as exc:
+            self.logger.debug(f"tcpdump stderr 读取结束：{type(exc).__name__}: {exc}")
 
     def stop(self) -> dict[str, Any]:
         proc = None
@@ -1717,6 +1836,38 @@ class StbDiscoveryService:
                 safe_portal_auth["has_ctc_auth_info"] = bool(portal_auth.get("ctc_auth_info"))
                 safe_portal_auth["has_upload_user_token"] = bool(portal_auth.get("user_token"))
                 safe_portal_auth["has_x_frame_session_id"] = bool(portal_auth.get("x_frame_session_id"))
+                meta = self._pcap_meta_locked()
+                # 区分三种结果，避免把「没抓到包」和「有包但解析不出频道」
+                # 都报成成功——这是此前排查耗时的主因。
+                pcap_size = int(meta.get("pcap_size") or 0)
+                diagnostics = {
+                    "pcap_size": pcap_size,
+                    "stream_count": len(streams),
+                    "matched_response_streams": sum(
+                        1 for key in streams if key[2] == (stb_ip or "") and key[0] != stb_ip
+                    ),
+                    "channels": len(channels),
+                }
+                if pcap_size <= 0:
+                    hint = (
+                        "未捕获到任何数据。请确认：1) 抓包接口是否为真实的物理口"
+                        "（不要用 any，tcpdump 在 any 上会因不支持混杂模式而失败）；"
+                        "2) 抓包点是否能看到机顶盒与 IPTV 网关之间的单播流量；"
+                        "3) 容器需要 network_mode: host 与 cap_add NET_ADMIN, NET_RAW。"
+                    )
+                    with self._lock:
+                        self._state["status"] = self.STATUS_ERROR
+                        self._state["error"] = f"未捕获到数据：{hint}"
+                        self._state["channels"] = []
+                        self._state["channel_count"] = 0
+                        self._state["auth_info"] = auth_info
+                        self._state["epg_creds"] = epg_creds
+                        self._state["portal_auth"] = safe_portal_auth
+                        self._state["protocol_artifacts"] = protocol_artifacts
+                        self._state["diagnostics"] = diagnostics
+                        self._state.update(meta)
+                    self.logger.error(f"STB 频道发现失败：{hint}")
+                    return
                 with self._lock:
                     self._state["status"] = self.STATUS_DONE
                     self._state["channels"] = channels
@@ -1726,7 +1877,8 @@ class StbDiscoveryService:
                     self._state["epg_creds"] = epg_creds
                     self._state["portal_auth"] = safe_portal_auth
                     self._state["protocol_artifacts"] = protocol_artifacts
-                    self._state.update(self._pcap_meta_locked())
+                    self._state["diagnostics"] = diagnostics
+                    self._state.update(meta)
                 has_auth = bool(auth_info.get("mac") or auth_info.get("assigned_ip"))
                 self.logger.info(
                     f"STB 频道发现完成：共发现 {len(channels)} 个频道，"
@@ -1735,6 +1887,13 @@ class StbDiscoveryService:
                     f"门户会话字段：{'已捕获' if portal_auth else '未捕获'}，"
                     f"原始PCAP归档：{'已保存' if archived_pcap else '失败'}"
                 )
+                if not channels:
+                    self.logger.warning(
+                        f"已捕获 {pcap_size} 字节数据但未解析出频道："
+                        f"TCP 流 {len(streams)} 条，匹配响应流 "
+                        f"{diagnostics['matched_response_streams']} 条。"
+                        "请确认抓包覆盖了机顶盒开机全过程，并在捕获期间重启机顶盒。"
+                    )
             except Exception as exc:
                 self.logger.error(f"STB 频道发现分析失败：{exc}")
                 with self._lock:

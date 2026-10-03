@@ -929,6 +929,14 @@ def test_stb_full_capture_keeps_all_stb_traffic_and_dhcp(tmp_path, monkeypatch):
     class _FakeProc:
         stdout = io.BytesIO()
         stderr = io.BytesIO()
+        returncode = None
+
+        def poll(self):
+            return None
+        returncode = None
+
+        def poll(self):
+            return None
 
     class _FakeThread:
         def __init__(self, *args, **kwargs):
@@ -938,6 +946,7 @@ def test_stb_full_capture_keeps_all_stb_traffic_and_dhcp(tmp_path, monkeypatch):
             pass
 
     monkeypatch.setattr(stb_discovery_module.shutil, "which", lambda name: "/usr/sbin/tcpdump")
+    monkeypatch.setattr(stb_discovery_module, "_probe_tcpdump_interfaces", lambda: "eth0")
     monkeypatch.setattr(stb_discovery_module.tempfile, "mktemp", lambda **kwargs: str(tmp_path / "capture.pcap"))
     monkeypatch.setattr(stb_discovery_module.subprocess, "Popen", lambda command, **kwargs: commands.append(command) or _FakeProc())
     monkeypatch.setattr(stb_discovery_module.threading, "Thread", _FakeThread)
@@ -954,6 +963,14 @@ def test_stb_full_capture_avoids_stale_ip_filter(tmp_path, monkeypatch):
     class _FakeProc:
         stdout = io.BytesIO()
         stderr = io.BytesIO()
+        returncode = None
+
+        def poll(self):
+            return None
+        returncode = None
+
+        def poll(self):
+            return None
 
     class _FakeThread:
         def __init__(self, *args, **kwargs):
@@ -963,6 +980,7 @@ def test_stb_full_capture_avoids_stale_ip_filter(tmp_path, monkeypatch):
             pass
 
     monkeypatch.setattr(stb_discovery_module.shutil, "which", lambda name: "/usr/sbin/tcpdump")
+    monkeypatch.setattr(stb_discovery_module, "_probe_tcpdump_interfaces", lambda: "eth0")
     monkeypatch.setattr(stb_discovery_module.tempfile, "mktemp", lambda **kwargs: str(tmp_path / "capture.pcap"))
     monkeypatch.setattr(stb_discovery_module.subprocess, "Popen", lambda command, **kwargs: commands.append(command) or _FakeProc())
     monkeypatch.setattr(stb_discovery_module.threading, "Thread", _FakeThread)
