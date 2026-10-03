@@ -112,7 +112,7 @@ def _extract_dhcp_from_pcap(pcap_path: str) -> dict[str, Any]:
         if len(header) < 24:
             return {}
         magic = struct.unpack("<I", header[:4])[0]
-        if magic not in (0xA1B2C3D4, 0xD3B4A1B2):
+        if magic not in (0xA1B2C3D4, 0xA1B23C4D):
             return {}
         linktype = struct.unpack("<I", header[20:24])[0]
         while True:
@@ -369,7 +369,7 @@ def _reassemble_tcp_streams(pcap_path: str) -> dict[tuple[str, int, str, int], b
         if len(header) < 24:
             return {}
         magic = struct.unpack("<I", header[:4])[0]
-        if magic not in (0xA1B2C3D4, 0xD3B4A1B2):
+        if magic not in (0xA1B2C3D4, 0xA1B23C4D):
             return {}
         linktype = struct.unpack("<I", header[20:24])[0]
         while True:
