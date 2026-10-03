@@ -55,6 +55,43 @@ def normalize_mac(value: str | None) -> str:
     )
 
 
+def _count_pcap_macs(pcap_path: str) -> dict[str, int]:
+    """统计 pcap 里各 MAC 出现次数，用于确认用户填的 MAC 是否真的在流量里。
+
+    `ether host <mac>` 是合法 BPF，即使 MAC 不在网络上 tcpdump 也会正常启动，
+    只会安静地抓 0 包。有了这个计数才能把「设备 MAC 填错/抓包点看不到」
+    与「解析器不匹配」区分开。
+
+    只统计以太网链路：SLL/SLL2 帧头偏移不同，误读会得到垃圾地址。
+    """
+    counts: dict[str, int] = {}
+    try:
+        with open(pcap_path, "rb") as f:
+            header = f.read(24)
+            if len(header) < 24:
+                return counts
+            magic = struct.unpack("<I", header[:4])[0]
+            if magic not in (0xA1B2C3D4, 0xD3B4A1B2):
+                return counts
+            linktype = struct.unpack("<I", header[20:24])[0]
+            if linktype != 1:  # DLT_EN10MB only
+                return counts
+            while True:
+                pkt_header = f.read(16)
+                if len(pkt_header) < 16:
+                    break
+                _, _, incl_len, _ = struct.unpack("<IIII", pkt_header)
+                packet = f.read(incl_len)
+                if len(packet) < incl_len or incl_len < 12:
+                    continue
+                for offset in (0, 6):
+                    mac = ":".join(f"{b:02x}" for b in packet[offset : offset + 6])
+                    counts[mac] = counts.get(mac, 0) + 1
+    except Exception:
+        return counts
+    return counts
+
+
 # ── DHCP helpers ─────────────────────────────────────────────────────────────
 
 def _parse_dhcp_options(options_bytes: bytes) -> dict[int, bytes]:
@@ -1311,6 +1348,7 @@ class StbDiscoveryService:
             "status": self.STATUS_IDLE,
             "stb_ip": None,
             "stb_mac": "",
+            "detected_mac": "",
             "interface": None,
             "started_at": None,
             "stopped_at": None,
@@ -1596,6 +1634,12 @@ class StbDiscoveryService:
                     if self._state["status"] == self.STATUS_CAPTURING:
                         self._state["live_channel_count"] = len(channels)
                         self._state["live_has_auth"] = has_auth
+                        # DHCP chaddr already carries the STB MAC; surface it so
+                        # the UI can prefill the field instead of making the user
+                        # read it off the device label or a DHCP lease.
+                        detected = normalize_mac(auth_info.get("mac") or "")
+                        if detected:
+                            self._state["detected_mac"] = detected
             except Exception:
                 pass
 
@@ -1636,6 +1680,7 @@ class StbDiscoveryService:
                 "status": self.STATUS_CAPTURING,
                 "stb_ip": stb_ip,
                 "stb_mac": mac,
+                "detected_mac": "",
                 "interface": interface,
                 "full_capture": bool(full_capture),
                 "started_at": time.time(),
@@ -1730,6 +1775,11 @@ class StbDiscoveryService:
                 epg_creds: dict[str, str] = {}
                 portal_auth: dict[str, Any] = {}
                 protocol_artifacts: dict[str, Any] = {"saved": False}
+                # A wrong MAC still produces a valid `ether host` expression, so
+                # tcpdump starts fine and simply records nothing.  Counting the
+                # MACs actually present lets us say so instead of leaving the
+                # user with a bare "0 channels".
+                mac_counts = _count_pcap_macs(pcap_path) if pcap_path else {}
                 if pcap_path and os.path.exists(pcap_path):
                     streams = _reassemble_tcp_streams(pcap_path)
                     protocol_artifacts = self._persist_protocol_artifacts(
@@ -1770,6 +1820,20 @@ class StbDiscoveryService:
                 safe_portal_auth["has_ctc_auth_info"] = bool(portal_auth.get("ctc_auth_info"))
                 safe_portal_auth["has_upload_user_token"] = bool(portal_auth.get("user_token"))
                 safe_portal_auth["has_x_frame_session_id"] = bool(portal_auth.get("x_frame_session_id"))
+                mac_requested = str(self._state.get("stb_mac") or "")
+                mac_seen = int(mac_counts.get(mac_requested, 0)) if mac_requested else 0
+                mac_not_seen = bool(mac_requested) and mac_seen == 0
+                diagnostics = {
+                    "pcap_size": int(self._pcap_meta_locked().get("pcap_size") or 0),
+                    "stream_count": len(streams),
+                    "matched_response_streams": sum(
+                        1 for key in streams if key[2] == (stb_ip or "") and key[0] != stb_ip
+                    ),
+                    "channels": len(channels),
+                    "mac_requested": mac_requested,
+                    "mac_seen_count": mac_seen,
+                    "mac_not_seen": mac_not_seen,
+                }
                 with self._lock:
                     self._state["status"] = self.STATUS_DONE
                     self._state["channels"] = channels
@@ -1779,6 +1843,7 @@ class StbDiscoveryService:
                     self._state["epg_creds"] = epg_creds
                     self._state["portal_auth"] = safe_portal_auth
                     self._state["protocol_artifacts"] = protocol_artifacts
+                    self._state["diagnostics"] = diagnostics
                     self._state.update(self._pcap_meta_locked())
                 has_auth = bool(auth_info.get("mac") or auth_info.get("assigned_ip"))
                 self.logger.info(
@@ -1788,6 +1853,18 @@ class StbDiscoveryService:
                     f"门户会话字段：{'已捕获' if portal_auth else '未捕获'}，"
                     f"原始PCAP归档：{'已保存' if archived_pcap else '失败'}"
                 )
+                if mac_not_seen:
+                    self.logger.warning(
+                        f"抓包中未出现指定的 MAC {mac_requested}，"
+                        "该过滤器不会捕获任何数据。请确认填写的是机顶盒的 MAC，"
+                        "且抓包点能看到它与 IPTV 网关之间的流量。"
+                    )
+                if not channels:
+                    self.logger.warning(
+                        f"共发现 0 个频道：TCP 流 {len(streams)} 条，"
+                        f"匹配响应流 {diagnostics['matched_response_streams']} 条。"
+                        "请确认抓包覆盖了机顶盒开机全过程，并在捕获期间重启机顶盒。"
+                    )
             except Exception as exc:
                 self.logger.error(f"STB 频道发现分析失败：{exc}")
                 with self._lock:

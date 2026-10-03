@@ -1396,6 +1396,14 @@ function renderStbDiscoveryStatus(state) {
   badge.textContent = STB_STATUS_LABELS[status] || status;
   badge.className = `chip ${STB_STATUS_CHIP[status] || "neutral"}`;
 
+  // DHCP chaddr already gives us the STB MAC, so prefill it instead of making
+  // the user read it off the device label or a DHCP lease.  Only fills an empty
+  // field so it never overrides a value the user typed deliberately.
+  const macInput = $("stbDiscoveryMac");
+  if (macInput && !macInput.value.trim() && state.detected_mac) {
+    macInput.value = state.detected_mac;
+  }
+
   const box = $("stbDiscoveryStatus");
   const isCapturing = status === "capturing";
   const isAnalyzing = status === "analyzing";
@@ -1439,8 +1447,20 @@ function renderStbDiscoveryStatus(state) {
     box.className = "result-box warning";
   } else if (isDone) {
     const n = state.channel_count || 0;
-    box.textContent = n > 0 ? `捕获完成，共发现 ${n} 个频道。` : "捕获完成，未发现频道。请确认机顶盒已完成开机流程。";
-    box.className = n > 0 ? "result-box ok" : "result-box warning";
+    const diag = state.diagnostics || {};
+    let text = n > 0
+      ? `捕获完成，共发现 ${n} 个频道。`
+      : "捕获完成，未发现频道。请确认机顶盒已完成开机流程。";
+    // A wrong MAC still yields a valid filter, so tcpdump records nothing and
+    // the user is left with a bare "0 channels".  Say what actually happened.
+    if (diag.mac_not_seen) {
+      text = `抓包中未出现 MAC ${diag.mac_requested || ""}，该过滤器没有捕获到任何数据。\n`
+        + "请确认填写的是机顶盒的 MAC（不是光猫的），且抓包点能看到机顶盒与 IPTV 网关之间的流量。";
+      box.className = "result-box error";
+    } else {
+      box.className = n > 0 ? "result-box ok" : "result-box warning";
+    }
+    box.textContent = text;
     renderStbDiscoveryChannels(state.channels || []);
     loadIptvAuthSummary().catch(() => {});
   } else if (isError) {

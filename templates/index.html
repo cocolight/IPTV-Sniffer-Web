@@ -132,7 +132,7 @@
                 <select id="stbDiscoveryIface"></select>
               </label>
             </div>
-            <p class="task-description">MAC 选填。填写后按二层地址过滤，不受 DHCP 地址变化影响——抓包开始时机顶盒可能还没拿到 IP，或 IP 在续租时变化，仅按 IP 过滤容易漏掉全部流量。</p>
+            <p class="task-description">MAC 选填。填写后按二层地址过滤，不受 DHCP 地址变化影响——抓包开始时机顶盒可能还没拿到 IP，或 IP 在续租时变化，仅按 IP 过滤容易漏掉全部流量。抓包时系统会从 DHCP 报文自动读出 MAC 并回填到此框，下次可直接使用。</p>
             <div class="form-actions">
               <button id="stbDiscoveryStartBtn" class="primary" type="button">开始捕获</button>
               <button id="stbDiscoveryStopBtn" class="secondary" type="button" disabled>停止 &amp; 分析</button>
