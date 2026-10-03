@@ -1429,7 +1429,10 @@ function renderStbDiscoveryStatus(state) {
     if (liveCount > 0) liveParts.push(`已发现 ${liveCount} 个频道`);
     if (state.live_has_auth) liveParts.push("已捕获认证信息");
     const liveHint = liveParts.length ? `\n${liveParts.join("\n")}。` : "";
-    box.textContent = `正在捕获 ${escapeHtml(state.stb_ip || "")} 的流量（${elapsed} 秒）…请立即重启机顶盒。\n一般约 30 秒可捕获到认证信息，约 60 秒可捕获到频道信息。${liveHint}`;
+    const target = state.stb_mac
+      ? `${escapeHtml(state.stb_mac)}`
+      : escapeHtml(state.stb_ip || "");
+    box.textContent = `正在捕获 ${target} 的流量（${elapsed} 秒）…请立即重启机顶盒。\n一般约 30 秒可捕获到认证信息，约 60 秒可捕获到频道信息。${liveHint}`;
     box.className = "result-box ok";
   } else if (isAnalyzing) {
     box.textContent = "正在分析 pcap 数据，提取频道信息…";
@@ -1540,10 +1543,11 @@ function stopStbDiscoveryPoll() {
 
 $("stbDiscoveryStartBtn").addEventListener("click", async () => {
   const ip = ($("stbDiscoveryIp").value || "").trim();
+  const mac = ($("stbDiscoveryMac").value || "").trim();
   const iface = ($("stbDiscoveryIface").value || "").trim() || "any";
   if (!ip) { alert("请填写机顶盒 IP 地址"); return; }
   try {
-    const data = await requestJson("/api/stb_discovery/start", {method: "POST", body: JSON.stringify({stb_ip: ip, interface: iface})});
+    const data = await requestJson("/api/stb_discovery/start", {method: "POST", body: JSON.stringify({stb_ip: ip, stb_mac: mac, interface: iface})});
     renderStbDiscoveryStatus(data);
     startStbDiscoveryPoll();
   } catch (err) { alert(err.message); }

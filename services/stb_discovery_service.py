@@ -24,6 +24,37 @@ def _parse_ip(data: bytes, off: int) -> str:
     return ".".join(str(b) for b in data[off : off + 4])
 
 
+_MAC_PLAIN = re.compile(r"^[0-9a-fA-F]{12}$")
+_MAC_COLON = re.compile(r"^[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5}$")
+_MAC_DASH = re.compile(r"^[0-9a-fA-F]{2}(?:-[0-9a-fA-F]{2}){5}$")
+_MAC_CISCO = re.compile(r"^[0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4}$")
+
+
+def normalize_mac(value: str | None) -> str:
+    """把常见 MAC 写法统一成小写冒号分隔；空值返回空串。
+
+    接受 `aa:bb:cc:dd:ee:ff`、`aa-bb-cc-dd-ee-ff` 与 Cisco 风格 `aabb.ccdd.eeff`。
+    格式非法时抛 ValueError，避免把 tcpdump 语法错误的表达式交给它——
+    那会让 tcpdump 启动即退出，而旧实现不会报告任何原因。
+    """
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    lowered = text.lower()
+    if _MAC_COLON.match(lowered):
+        return lowered
+    if _MAC_DASH.match(lowered):
+        return lowered.replace("-", ":")
+    if _MAC_CISCO.match(lowered):
+        compact = lowered.replace(".", "")
+        return ":".join(compact[i : i + 2] for i in range(0, 12, 2))
+    if _MAC_PLAIN.match(lowered):
+        return ":".join(lowered[i : i + 2] for i in range(0, 12, 2))
+    raise ValueError(
+        f"MAC 地址格式无效：{value!r}（示例：48:57:02:25:bb:e3、48-57-02-25-bb-e3 或 4857.0225.bbe3）"
+    )
+
+
 # ── DHCP helpers ─────────────────────────────────────────────────────────────
 
 def _parse_dhcp_options(options_bytes: bytes) -> dict[int, bytes]:
@@ -1279,6 +1310,7 @@ class StbDiscoveryService:
         self._state: dict[str, Any] = {
             "status": self.STATUS_IDLE,
             "stb_ip": None,
+            "stb_mac": "",
             "interface": None,
             "started_at": None,
             "stopped_at": None,
@@ -1580,7 +1612,14 @@ class StbDiscoveryService:
         state["latest_archive"] = archives[0] if archives else None
         return state
 
-    def start(self, stb_ip: str, interface: str = "any", full_capture: bool = False) -> None:
+    def start(
+        self,
+        stb_ip: str,
+        interface: str = "any",
+        full_capture: bool = False,
+        stb_mac: str = "",
+    ) -> None:
+        mac = normalize_mac(stb_mac)
         rt = self.runtime_check()
         if not rt["ok"]:
             raise RuntimeError("；".join(rt["errors"]))
@@ -1596,6 +1635,7 @@ class StbDiscoveryService:
             self._state = {
                 "status": self.STATUS_CAPTURING,
                 "stb_ip": stb_ip,
+                "stb_mac": mac,
                 "interface": interface,
                 "full_capture": bool(full_capture),
                 "started_at": time.time(),
@@ -1620,8 +1660,21 @@ class StbDiscoveryService:
             # Keep the complete STB session for later offline analysis: RTSP
             # control is TCP, while the negotiated media path can be UDP/RTP.
             # DHCP is included before the STB address is assigned.
-            cmd.append(f"host {stb_ip} or (udp and (port 67 or port 68))")
-        self.logger.info(f"开始捕获 STB 开机流量：STB={stb_ip}，接口={interface}，文件={self._pcap_path}")
+            #
+            # Prefer the STB MAC when it is known: the address is assigned by
+            # DHCP and may not exist yet when capture starts, or may change on
+            # renegotiation, so filtering by IP can silently capture nothing.
+            # ether host matches at layer 2 and is immune to both problems.
+            # DHCP stays in the expression because it happens before the STB
+            # has an address, and it carries the credentials we need.
+            if mac:
+                cmd.append(f"ether host {mac} or (udp and (port 67 or port 68))")
+            else:
+                cmd.append(f"host {stb_ip} or (udp and (port 67 or port 68))")
+        self.logger.info(
+            f"开始捕获 STB 开机流量：STB={stb_ip}"
+            f"{f'，MAC={mac}' if mac else ''}，接口={interface}，文件={self._pcap_path}"
+        )
         try:
             self._proc = subprocess.Popen(
                 cmd,
