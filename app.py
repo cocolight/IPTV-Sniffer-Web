@@ -3216,14 +3216,40 @@ def api_iptv_auth_egress_bpf_watch_configure():
         return api_error(str(exc))
 
 
+_RTP2HTTPD_UCI_SECTION_RE = re.compile(r"^config\s+(\S+)(?:\s+(.+))?$")
+_RTP2HTTPD_UCI_ENTRY_RE = re.compile(r"^(option|list)\s+([^\s=]+)(?:\s*=\s*|\s+)?(.*)$")
+
+
 def _parse_rtp2httpd_config_text(text: str) -> dict[str, Any]:
-    """Parse the small INI-like subset used by rtp2httpd configs."""
+    """Parse the small INI-like subset and the OpenWrt/UCI flavour of rtp2httpd configs."""
+    def strip_quotes(value: str) -> str:
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            return value[1:-1]
+        return value
+
     section = "global"
     values: dict[str, str] = {}
     bind_lines: list[str] = []
     for raw in text.splitlines():
         line = raw.strip()
         if not line or line.startswith(("#", ";")):
+            continue
+        uci_section = _RTP2HTTPD_UCI_SECTION_RE.match(line)
+        if uci_section:
+            section = strip_quotes(uci_section.group(2) or uci_section.group(1) or "") or "global"
+            continue
+        uci_entry = _RTP2HTTPD_UCI_ENTRY_RE.match(line)
+        if uci_entry:
+            key = strip_quotes(uci_entry.group(2)).replace("_", "-")
+            value = strip_quotes(uci_entry.group(3))
+            if uci_entry.group(1) == "list":
+                if key == "listen" and value:
+                    bind_lines.append(value)
+                continue
+            if key:
+                values[f"{section}.{key}"] = value
+                values.setdefault(key, value)
             continue
         if line.startswith("[") and line.endswith("]"):
             section = line[1:-1].strip() or "global"
@@ -3254,6 +3280,8 @@ def _rtp2httpd_config_candidates(path_hint: str) -> list[Path]:
         "/etc/rtp2httpd/rtp2httpd.conf",
         "/host/etc/rtp2httpd/rtp2httpd.conf",
         "/config/rtp2httpd.conf",
+        "/etc/config/rtp2httpd",
+        "/host/etc/config/rtp2httpd",
     ])
     seen: set[str] = set()
     result: list[Path] = []
@@ -3278,6 +3306,13 @@ def _load_rtp2httpd_config(path_hint: str) -> dict[str, Any]:
             text = path.read_text(encoding="utf-8", errors="replace")[:128_000]
             parsed = _parse_rtp2httpd_config_text(text)
             values = parsed["values"]
+            if not values and not parsed["bind"]:
+                return {
+                    "ok": False,
+                    "path": str(path),
+                    "checked": checked,
+                    "error": "已读取该文件但未解析出配置项，请确认它是 rtp2httpd 的 INI 或 OpenWrt UCI 配置",
+                }
             return {
                 "ok": True,
                 "path": str(path),

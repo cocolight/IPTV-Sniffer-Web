@@ -133,6 +133,20 @@ external-m3u-update-interval = 300
 
 若需要保留每个逻辑频道的所有备选线路，将地址改为 `/playlist-rtp2httpd-all.m3u`。这两个入口禁止缓存，并且不会输出可能导致递归代理的本站 `/live/` 地址。
 
+`rtp2httpd` 也可以由 OpenWrt / ImmortalWrt 的 UCI 管理，配置文件是 `/etc/config/rtp2httpd`，没有 `.conf` 后缀。把它挂载进容器并在播放诊断中填入路径即可，解析器同时识别 INI 与 UCI 两种格式：
+
+```uci
+config instance
+	option upstream_interface 'eth1'
+	option upstream_interface_multicast 'eth1'
+	option upstream_interface_fcc 'eth1'
+	option external_m3u 'file://overlay/rtt2http/utm.m3u8'
+	list listen '[::]:5140'
+	list listen '192.168.100.1:5140'
+```
+
+UCI 的下划线选项名等价于 INI 的连字符键名（`upstream_interface_fcc` 即 `upstream-interface-fcc`），`list listen` 会作为监听地址一并读出。若配置文件能被读取却解析不出任何配置项，诊断会把「rtp2httpd 配置文件」标为问题项，而不是默认按「系统路由表」判为正常。
+
 常见播放地址形态：
 
 ```text
@@ -189,6 +203,7 @@ http://rtp2httpd-host:5140/rtp/239.x.x.x:port
 
 | 版本 | 更新摘要 |
 | --- | --- |
+| `v1.3.4` | rtp2httpd 配置解析新增 OpenWrt/UCI 支持：诊断可直接读取 `/etc/config/rtp2httpd`，识别 `config` / `option` / `list` 语法并还原组播与 FCC 上游接口、`external-m3u`；配置可读但无法解析时不再默认判为正常。 |
 | `v1.3.3` | 增加可删除历史 PCAP 及协议清单的管理功能；完整灾备纳入原始抓包与敏感凭据的可选迁移；所有原“输入指定文本确认”改为连续两次弹窗确认；新增 rtp2httpd 最佳频道与全部线路的原始 RTP 动态订阅。 |
 | `v1.3.2` | 重构频道库为单一平铺视图：分类、订阅状态与 FCC / 回看 / 时移 / 4K 快捷筛选；直接显示 HD / 4K、能力与订阅状态；移除分组页面并收敛批量操作。 |
 | `v1.3.1` | 修正订阅别名语义：`/playlist-all.m3u` 明确为主订阅兼容别名；订阅清单纳入全局备份、恢复与清除；回看入口统一为稳定 `/catchup/<频道ID>`；时移长度统一使用分钟字段并兼容旧数据。 |
